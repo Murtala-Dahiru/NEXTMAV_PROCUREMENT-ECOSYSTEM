@@ -1,42 +1,71 @@
 // NextMav Procure — Formatting & display helpers
 
 import type {
+  Currency,
   Priority,
   RequestStatus,
   PurchaseOrderStatus,
   RFQStatus,
   VendorStatus,
 } from "./types";
+import { CURRENCY_META } from "./types";
+
+const CURRENCY_LOCALE: Record<Currency, string> = {
+  USD: "en-US",
+  EUR: "de-DE",
+  GBP: "en-GB",
+  NGN: "en-NG",
+  KES: "en-KE",
+  ZAR: "en-ZA",
+  GHS: "en-GH",
+  AED: "en-AE",
+  INR: "en-IN",
+};
 
 export function formatCurrency(
   amount: number,
-  currency: string = "USD",
+  currency: Currency | string = "NGN",
   options: Intl.NumberFormatOptions = {}
 ): string {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency,
-    maximumFractionDigits: 0,
-    ...options,
-  }).format(amount);
+  const cur = (currency as Currency) in CURRENCY_META ? (currency as Currency) : "NGN";
+  try {
+    return new Intl.NumberFormat(CURRENCY_LOCALE[cur] ?? "en-US", {
+      style: "currency",
+      currency: cur,
+      maximumFractionDigits: 0,
+      ...options,
+    }).format(amount);
+  } catch {
+    return `${CURRENCY_META[cur]?.symbol ?? "$"}${amount.toLocaleString()}`;
+  }
 }
 
-export function formatCurrencyDetailed(amount: number, currency: string = "USD"): string {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency,
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(amount);
+export function formatCurrencyDetailed(amount: number, currency: Currency | string = "NGN"): string {
+  const cur = (currency as Currency) in CURRENCY_META ? (currency as Currency) : "NGN";
+  try {
+    return new Intl.NumberFormat(CURRENCY_LOCALE[cur] ?? "en-US", {
+      style: "currency",
+      currency: cur,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(amount);
+  } catch {
+    return `${CURRENCY_META[cur]?.symbol ?? "$"}${amount.toFixed(2)}`;
+  }
 }
 
-export function formatCompactCurrency(amount: number, currency: string = "USD"): string {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency,
-    notation: "compact",
-    maximumFractionDigits: 1,
-  }).format(amount);
+export function formatCompactCurrency(amount: number, currency: Currency | string = "NGN"): string {
+  const cur = (currency as Currency) in CURRENCY_META ? (currency as Currency) : "NGN";
+  try {
+    return new Intl.NumberFormat(CURRENCY_LOCALE[cur] ?? "en-US", {
+      style: "currency",
+      currency: cur,
+      notation: "compact",
+      maximumFractionDigits: 1,
+    }).format(amount);
+  } catch {
+    return `${CURRENCY_META[cur]?.symbol ?? "$"}${(amount / 1000).toFixed(1)}k`;
+  }
 }
 
 export function formatNumber(value: number, options: Intl.NumberFormatOptions = {}): string {

@@ -94,6 +94,8 @@ export function RequestFormView() {
       title: title.trim(),
       departmentId,
       priority,
+      category: "General",
+      tags: [],
       businessJustification: businessJustification.trim(),
       neededByDate: new Date(neededByDate).toISOString(),
       lineItems: validItems.map(({ id: _id, ...rest }) => rest),

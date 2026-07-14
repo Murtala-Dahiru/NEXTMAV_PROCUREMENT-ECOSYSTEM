@@ -4,16 +4,22 @@
 
 import {
   Activity,
+  AlertTriangle,
   ArrowUpRight,
+  Bot,
   CheckCircle2,
   ClipboardCheck,
   Clock,
   DollarSign,
   FileText,
+  GitBranch,
   Package,
   Plus,
+  Sparkles,
   TrendingUp,
   Users,
+  Wallet,
+  Zap,
 } from "lucide-react";
 import {
   Area,
@@ -394,6 +400,132 @@ export function DashboardView() {
               </button>
             );
           })}
+        </div>
+      </SectionCard>
+
+      {/* Quick Actions & AI Insights */}
+      <div className="grid gap-4 lg:grid-cols-2">
+        {/* Quick Actions */}
+        <SectionCard title="Quick Actions" description="Jump to common tasks">
+          <div className="grid grid-cols-2 gap-3">
+            {[
+              { label: "New Request", icon: FileText, view: "request-new" as const, color: "bg-emerald-100 dark:bg-emerald-950/40 text-emerald-600 dark:text-emerald-400" },
+              { label: "New RFQ", icon: FileText, view: "rfq-new" as const, color: "bg-sky-100 dark:bg-sky-950/40 text-sky-600 dark:text-sky-400" },
+              { label: "Add Vendor", icon: Users, view: "vendors" as const, color: "bg-amber-100 dark:bg-amber-950/40 text-amber-600 dark:text-amber-400" },
+              { label: "View Approvals", icon: ClipboardCheck, view: "approvals" as const, color: "bg-violet-100 dark:bg-violet-950/40 text-violet-600 dark:text-violet-400" },
+              { label: "Budgets", icon: Wallet, view: "budgets" as const, color: "bg-teal-100 dark:bg-teal-950/40 text-teal-600 dark:text-teal-400" },
+              { label: "Reports", icon: TrendingUp, view: "reports" as const, color: "bg-rose-100 dark:bg-rose-950/40 text-rose-600 dark:text-rose-400" },
+            ].map((qa) => (
+              <button
+                key={qa.label}
+                onClick={() => navigate(qa.view)}
+                className="group flex items-center gap-3 rounded-lg border border-border bg-card p-3 hover:bg-muted/40 hover:border-emerald-300 transition-all text-left"
+              >
+                <div className={`flex h-9 w-9 items-center justify-center rounded-lg ${qa.color}`}>
+                  <qa.icon size={16} />
+                </div>
+                <span className="text-sm font-medium text-foreground">{qa.label}</span>
+              </button>
+            ))}
+          </div>
+        </SectionCard>
+
+        {/* AI Insights */}
+        <SectionCard
+          title="AI Insights"
+          description="Smart recommendations from your AI assistant"
+          action={
+            <button
+              onClick={() => navigate("ai-assistant")}
+              className="text-xs font-medium text-emerald-600 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300 flex items-center gap-0.5"
+            >
+              Open Assistant <ArrowUpRight size={12} />
+            </button>
+          }
+        >
+          <div className="space-y-3">
+            <div className="rounded-lg border border-amber-200 dark:border-amber-900 bg-amber-50/50 dark:bg-amber-950/15 p-3">
+              <div className="flex items-start gap-2">
+                <AlertTriangle size={15} className="text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-xs font-medium text-foreground">SLA breach risk</p>
+                  <p className="text-xs text-muted-foreground mt-0.5">PR-2026-0006 approval SLA expires in 24 hours. Consider escalating.</p>
+                </div>
+              </div>
+            </div>
+            <div className="rounded-lg border border-emerald-200 dark:border-emerald-900 bg-emerald-50/50 dark:bg-emerald-950/15 p-3">
+              <div className="flex items-start gap-2">
+                <TrendingUp size={15} className="text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-xs font-medium text-foreground">Cost saving opportunity</p>
+                  <p className="text-xs text-muted-foreground mt-0.5">Consolidating 4 construction material vendors could yield ~$18k annual savings.</p>
+                </div>
+              </div>
+            </div>
+            <div className="rounded-lg border border-sky-200 dark:border-sky-900 bg-sky-50/50 dark:bg-sky-950/15 p-3">
+              <div className="flex items-start gap-2">
+                <Bot size={15} className="text-sky-600 dark:text-sky-400 shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-xs font-medium text-foreground">Vendor recommendation</p>
+                  <p className="text-xs text-muted-foreground mt-0.5">For IT equipment, TechCore Distributors has 94% on-time delivery and 4.7 rating.</p>
+                </div>
+              </div>
+            </div>
+            <button
+              onClick={() => navigate("ai-assistant")}
+              className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:opacity-95 transition-opacity"
+            >
+              <Sparkles size={14} />
+              Ask AI Assistant
+            </button>
+          </div>
+        </SectionCard>
+      </div>
+
+      {/* Approval bottlenecks */}
+      <SectionCard title="Approval Bottlenecks" description="Requests approaching or breaching SLA">
+        <div className="space-y-2">
+          {requests
+            .filter((r) => r.approvals.some((a) => a.decision === "PENDING"))
+            .slice(0, 4)
+            .map((r) => {
+              const pending = r.approvals.find((a) => a.decision === "PENDING")!;
+              const hoursLeft = (new Date(pending.slaExpiresAt).getTime() - Date.now()) / (1000 * 60 * 60);
+              const isBreached = hoursLeft < 0;
+              const isWarning = hoursLeft >= 0 && hoursLeft < 12;
+              return (
+                <button
+                  key={r.id}
+                  onClick={() => {
+                    useStore.getState().selectRequest(r.id);
+                    navigate("request-detail");
+                  }}
+                  className="w-full flex items-center gap-3 rounded-lg border border-border bg-card p-3 hover:bg-muted/30 transition-colors text-left"
+                >
+                  <div className={`flex h-9 w-9 items-center justify-center rounded-lg shrink-0 ${
+                    isBreached ? "bg-rose-100 dark:bg-rose-950/40 text-rose-600 dark:text-rose-400" :
+                    isWarning ? "bg-amber-100 dark:bg-amber-950/40 text-amber-600 dark:text-amber-400" :
+                    "bg-emerald-100 dark:bg-emerald-950/40 text-emerald-600 dark:text-emerald-400"
+                  }`}>
+                    {isBreached ? <AlertTriangle size={15} /> : <Clock size={15} />}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-foreground truncate">{r.title}</p>
+                    <p className="text-xs text-muted-foreground truncate">{r.requestNumber} · Pending at {pending.stage.replace("_", " ").toLowerCase()} stage</p>
+                  </div>
+                  <div className="text-right shrink-0">
+                    <p className={`text-xs font-medium ${
+                      isBreached ? "text-rose-600 dark:text-rose-400" :
+                      isWarning ? "text-amber-600 dark:text-amber-400" :
+                      "text-muted-foreground"
+                    }`}>
+                      {isBreached ? "SLA breached" : `${hoursLeft.toFixed(0)}h left`}
+                    </p>
+                    <p className="text-xs text-foreground tabular-nums">{formatCurrency(r.totalEstimated)}</p>
+                  </div>
+                </button>
+              );
+            })}
         </div>
       </SectionCard>
     </div>

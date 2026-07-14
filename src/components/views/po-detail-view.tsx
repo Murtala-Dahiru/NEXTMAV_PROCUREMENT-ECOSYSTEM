@@ -7,7 +7,9 @@ import {
   Building2,
   Calendar,
   Check,
+  DollarSign,
   Download,
+  FileText,
   Mail,
   MapPin,
   Package,
@@ -81,14 +83,47 @@ export function PoDetailView() {
             <span className="hidden sm:inline">Print</span>
           </button>
           <button
-            onClick={() => toast.info("PDF export", { description: "PDF would be downloaded in production." })}
+            onClick={async () => {
+              const csvData = po.lineItems.map((li) => ({
+                item: li.itemName,
+                description: li.description ?? "",
+                quantity: li.quantity,
+                unit: li.unit,
+                unitCost: li.estimatedCost,
+                total: li.quantity * li.estimatedCost,
+              }));
+              try {
+                const res = await fetch("/api/export?XTransformPort=3001", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ type: "purchase_order", data: csvData, format: "csv" }),
+                });
+                if (res.ok) {
+                  const blob = await res.blob();
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a");
+                  a.href = url;
+                  a.download = `${po.poNumber}.csv`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                  toast.success("PO exported", { description: `${po.poNumber} line items downloaded as CSV` });
+                }
+              } catch {
+                toast.error("Export failed");
+              }
+            }}
             className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-card px-3 text-sm font-medium hover:bg-muted transition-colors"
           >
             <Download size={14} />
-            <span className="hidden sm:inline">Download PDF</span>
+            <span className="hidden sm:inline">Export CSV</span>
           </button>
           <button
-            onClick={() => toast.info("Email sent", { description: `PO emailed to ${vendor?.email}` })}
+            onClick={() => {
+              const vendor = useStore.getState().vendors.find((v) => v.id === po.vendorId);
+              const mailto = `mailto:${vendor?.email}?subject=${encodeURIComponent(`Purchase Order ${po.poNumber}`)}&body=${encodeURIComponent(`Dear ${vendor?.contactPerson},\n\nPlease find attached Purchase Order ${po.poNumber} for ${formatCurrency(po.totalAmount, po.currency)}.\n\nDelivery expected by ${formatDate(po.expectedDelivery)}.\n\nRegards,\nProcurement Team`)}`;
+              window.open(mailto, "_blank");
+              toast.success("Email draft opened", { description: `Email to ${vendor?.email} opened in your mail client` });
+            }}
             className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-primary px-3.5 text-sm font-medium text-primary-foreground hover:opacity-95 transition-opacity"
           >
             <Mail size={14} />
@@ -268,6 +303,146 @@ export function PoDetailView() {
               </button>
             ))}
           </div>
+        </SectionCard>
+      </div>
+
+      {/* Version history */}
+      {po.revisions.length > 1 && (
+        <div className="print:hidden">
+          <SectionCard title="Version History" description={`This PO has been revised ${po.revisions.length - 1} time(s)`}>
+            <div className="space-y-3">
+              {po.revisions.map((rev, idx) => {
+                const isLatest = idx === po.revisions.length - 1;
+                const user = useStore.getState().users.find((u) => u.id === rev.modifiedBy);
+                return (
+                  <div key={rev.version} className="flex items-start gap-3">
+                    <div className={cn(
+                      "flex h-8 w-8 items-center justify-center rounded-lg shrink-0 font-semibold text-xs",
+                      isLatest ? "bg-emerald-100 dark:bg-emerald-950/40 text-emerald-600 dark:text-emerald-400" : "bg-muted text-muted-foreground"
+                    )}>
+                      v{rev.version}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <p className="text-sm font-medium text-foreground">{rev.reason}</p>
+                        {isLatest && <span className="text-[10px] font-medium text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/40 px-1.5 py-0.5 rounded-full">CURRENT</span>}
+                      </div>
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        {user?.name ?? "Unknown"} · {new Date(rev.modifiedAt).toLocaleString()}
+                      </p>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </SectionCard>
+        </div>
+      )}
+
+      {/* Terms & Conditions */}
+      {po.termsAndConditions && (
+        <div className="print:hidden">
+          <SectionCard title="Terms & Conditions" description="Legal terms applicable to this purchase order">
+            <pre className="text-xs text-foreground whitespace-pre-wrap font-sans leading-relaxed">{po.termsAndConditions}</pre>
+          </SectionCard>
+        </div>
+      )}
+
+      {/* Related Transactions */}
+      <div className="print:hidden grid gap-4 lg:grid-cols-3">
+        {/* Goods Receipts */}
+        <SectionCard title="Goods Receipts" description={`${useStore.getState().goodsReceipts.filter((g) => g.poId === po.id).length} receipt(s)`} bodyClassName="p-0">
+          {(() => {
+            const receipts = useStore.getState().goodsReceipts.filter((g) => g.poId === po.id);
+            if (receipts.length === 0) {
+              return <div className="px-5 py-6 text-center text-xs text-muted-foreground">No goods receipts yet</div>;
+            }
+            return (
+              <div className="divide-y divide-border">
+                {receipts.map((gr) => (
+                  <button
+                    key={gr.id}
+                    onClick={() => useStore.getState().navigate("goods-receipts")}
+                    className="w-full flex items-center gap-2 px-5 py-3 hover:bg-muted/30 transition-colors text-left"
+                  >
+                    <Package size={14} className="text-muted-foreground shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-mono text-foreground">{gr.receiptNumber}</p>
+                      <p className="text-[10px] text-muted-foreground">{formatDate(gr.receivedDate)}</p>
+                    </div>
+                    <span className={cn(
+                      "text-[10px] font-medium px-1.5 py-0.5 rounded-full",
+                      gr.status === "RECEIVED" && "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300",
+                      gr.status === "PARTIAL" && "bg-sky-50 text-sky-700 dark:bg-sky-950/40 dark:text-sky-300",
+                      gr.status === "PENDING" && "bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300",
+                      gr.status === "REJECTED" && "bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-300"
+                    )}>{gr.status}</span>
+                  </button>
+                ))}
+              </div>
+            );
+          })()}
+        </SectionCard>
+
+        {/* Invoices */}
+        <SectionCard title="Invoices" description={`${useStore.getState().invoices.filter((i) => i.poId === po.id).length} invoice(s)`} bodyClassName="p-0">
+          {(() => {
+            const poInvoices = useStore.getState().invoices.filter((i) => i.poId === po.id);
+            if (poInvoices.length === 0) {
+              return <div className="px-5 py-6 text-center text-xs text-muted-foreground">No invoices yet</div>;
+            }
+            return (
+              <div className="divide-y divide-border">
+                {poInvoices.map((inv) => (
+                  <button
+                    key={inv.id}
+                    onClick={() => useStore.getState().navigate("invoices")}
+                    className="w-full flex items-center gap-2 px-5 py-3 hover:bg-muted/30 transition-colors text-left"
+                  >
+                    <FileText size={14} className="text-muted-foreground shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-mono text-foreground">{inv.invoiceNumber}</p>
+                      <p className="text-[10px] text-muted-foreground tabular-nums">{formatCurrency(inv.totalAmount, inv.currency)}</p>
+                    </div>
+                    <span className={cn(
+                      "text-[10px] font-medium px-1.5 py-0.5 rounded-full",
+                      inv.status === "PAID" && "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300",
+                      inv.status === "APPROVED" && "bg-sky-50 text-sky-700 dark:bg-sky-950/40 dark:text-sky-300",
+                      inv.status === "OVERDUE" && "bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-300",
+                      inv.status === "SUBMITTED" && "bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300"
+                    )}>{inv.status}</span>
+                  </button>
+                ))}
+              </div>
+            );
+          })()}
+        </SectionCard>
+
+        {/* Payments */}
+        <SectionCard title="Payments" description={`${useStore.getState().payments.filter((p) => { const inv = useStore.getState().invoices.find((i) => i.id === p.invoiceId); return inv?.poId === po.id; }).length} payment(s)`} bodyClassName="p-0">
+          {(() => {
+            const poPayments = useStore.getState().payments.filter((p) => {
+              const inv = useStore.getState().invoices.find((i) => i.id === p.invoiceId);
+              return inv?.poId === po.id;
+            });
+            if (poPayments.length === 0) {
+              return <div className="px-5 py-6 text-center text-xs text-muted-foreground">No payments yet</div>;
+            }
+            return (
+              <div className="divide-y divide-border">
+                {poPayments.map((pmt) => (
+                  <div key={pmt.id} className="flex items-center gap-2 px-5 py-3">
+                    <DollarSign size={14} className="text-muted-foreground shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-mono text-foreground">{pmt.paymentNumber}</p>
+                      <p className="text-[10px] text-muted-foreground">{formatDate(pmt.paymentDate)}</p>
+                    </div>
+                    <span className="text-xs font-semibold text-foreground tabular-nums">{formatCurrency(pmt.amount, pmt.currency)}</span>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
         </SectionCard>
       </div>
     </div>

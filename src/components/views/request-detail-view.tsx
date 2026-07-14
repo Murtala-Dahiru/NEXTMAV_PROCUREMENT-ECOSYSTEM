@@ -23,7 +23,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { useStore } from "@/lib/store";
-import { Avatar, PageHeader, PriorityBadge, SectionCard, StatusBadge } from "@/components/shared";
+import { Avatar, PageHeader, PriorityBadge, SectionCard, SlaIndicator, StatusBadge, Tag } from "@/components/shared";
 import { formatCurrency, formatDate, formatDateTime, formatRelativeTime } from "@/lib/format";
 import { ROLE_LABELS, type ApprovalStage } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -39,10 +39,13 @@ export function RequestDetailView() {
   const approveRequest = useStore((s) => s.approveRequest);
   const submitRequest = useStore((s) => s.submitRequest);
   const cancelRequest = useStore((s) => s.cancelRequest);
+  const duplicateRequest = useStore((s) => s.duplicateRequest);
+  const addComment = useStore((s) => s.addComment);
 
   const [comment, setComment] = useState("");
   const [showApproveDialog, setShowApproveDialog] = useState(false);
   const [decision, setDecision] = useState<"APPROVED" | "REJECTED" | "CHANGES_REQUESTED">("APPROVED");
+  const [newComment, setNewComment] = useState("");
 
   const req = requests.find((r) => r.id === requestId);
 
@@ -104,10 +107,21 @@ export function RequestDetailView() {
         >
           <ArrowLeft size={14} /> Back to requests
         </button>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <button className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-card px-3 text-sm font-medium hover:bg-muted transition-colors">
             <Download size={14} />
             <span className="hidden sm:inline">Export</span>
+          </button>
+          <button
+            onClick={() => {
+              const id = duplicateRequest(req.id);
+              useStore.getState().selectRequest(id);
+              toast.success("Request duplicated", { description: "A draft copy has been created." });
+            }}
+            className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-card px-3 text-sm font-medium hover:bg-muted transition-colors"
+          >
+            <FileText size={14} />
+            <span className="hidden sm:inline">Duplicate</span>
           </button>
           {canEdit && (
             <button className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-card px-3 text-sm font-medium hover:bg-muted transition-colors">
@@ -305,6 +319,14 @@ export function RequestDetailView() {
                           >
                             {ap.decision.replace("_", " ").toLowerCase()}
                           </span>
+                          {ap.decision === "PENDING" && (
+                            <SlaIndicator slaExpiresAt={ap.slaExpiresAt} />
+                          )}
+                          {ap.isEscalated && (
+                            <span className="inline-flex items-center gap-1 text-[10px] font-medium text-rose-700 dark:text-rose-300 bg-rose-50 dark:bg-rose-950/40 px-1.5 py-0.5 rounded-full">
+                              ⚡ Escalated
+                            </span>
+                          )}
                         </div>
                         <p className="text-xs text-muted-foreground mt-0.5">
                           {approver?.name} · {approver ? ROLE_LABELS[approver.role] : "—"}
@@ -405,6 +427,74 @@ export function RequestDetailView() {
           </SectionCard>
         </div>
       </div>
+
+      {/* Comments section */}
+      <SectionCard
+        title="Comments & Activity"
+        description={`${req.comments.length} comment${req.comments.length !== 1 ? "s" : ""} on this request`}
+      >
+        <div className="space-y-4">
+          {req.comments.length === 0 ? (
+            <p className="text-sm text-muted-foreground text-center py-4">No comments yet. Start the conversation below.</p>
+          ) : (
+            req.comments.map((c) => {
+              const author = users.find((u) => u.id === c.authorId);
+              return (
+                <div key={c.id} className="flex gap-3">
+                  <Avatar initials={author?.initials ?? "?"} color={author?.avatarColor ?? "bg-slate-500"} size="sm" />
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="text-sm font-medium text-foreground">{author?.name ?? "Unknown"}</p>
+                      <span className="text-xs text-muted-foreground">{formatRelativeTime(c.createdAt)}</span>
+                      {c.mentions.length > 0 && (
+                        c.mentions.map((m) => {
+                          const mentioned = users.find((u) => u.id === m);
+                          return <Tag key={m} label={`@${mentioned?.name ?? m}`} color="emerald" />;
+                        })
+                      )}
+                    </div>
+                    <p className="text-sm text-foreground mt-0.5 whitespace-pre-wrap">{c.content}</p>
+                  </div>
+                </div>
+              );
+            })
+          )}
+          <div className="flex gap-3 pt-3 border-t border-border">
+            <Avatar initials={currentUser.initials} color={currentUser.avatarColor} size="sm" />
+            <div className="flex-1 min-w-0">
+              <textarea
+                value={newComment}
+                onChange={(e) => setNewComment(e.target.value)}
+                placeholder="Add a comment… (use @ to mention someone)"
+                rows={2}
+                className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent transition-all resize-none"
+              />
+              <div className="mt-2 flex justify-end">
+                <button
+                  onClick={() => {
+                    if (newComment.trim()) {
+                      const mentions: string[] = [];
+                      const mentionRegex = /@(\w+\.\w+)/g;
+                      let match;
+                      while ((match = mentionRegex.exec(newComment)) !== null) {
+                        const user = users.find((u) => u.email.split("@")[0] === match[1]);
+                        if (user) mentions.push(user.id);
+                      }
+                      addComment("REQUEST", req.id, newComment.trim(), mentions);
+                      setNewComment("");
+                      toast.success("Comment added");
+                    }
+                  }}
+                  disabled={!newComment.trim()}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground hover:opacity-95 transition-opacity disabled:opacity-50"
+                >
+                  <Send size={12} /> Post Comment
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </SectionCard>
 
       {/* Confirmation dialog */}
       {showApproveDialog && (

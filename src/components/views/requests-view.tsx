@@ -4,15 +4,18 @@
 
 import { useMemo, useState } from "react";
 import {
+  Ban,
+  Check,
   ClipboardList,
   Download,
   Filter,
   Plus,
   Search,
   SlidersHorizontal,
+  X,
 } from "lucide-react";
 import { useStore } from "@/lib/store";
-import { Avatar, EmptyState, PageHeader, PriorityBadge, StatusBadge } from "@/components/shared";
+import { Avatar, BulkActionBar, EmptyState, PageHeader, PriorityBadge, StatusBadge } from "@/components/shared";
 import { formatCurrency, formatRelativeTime } from "@/lib/format";
 import { type Priority, type RequestStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -23,14 +26,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { toast } from "sonner";
 
 export function RequestsView() {
   const navigate = useStore((s) => s.navigate);
@@ -38,11 +34,13 @@ export function RequestsView() {
   const requests = useStore((s) => s.requests);
   const users = useStore((s) => s.users);
   const departments = useStore((s) => s.departments);
+  const bulkUpdate = useStore((s) => s.bulkUpdateRequestStatus);
 
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("ALL");
   const [priorityFilter, setPriorityFilter] = useState<string>("ALL");
   const [deptFilter, setDeptFilter] = useState<string>("ALL");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
 
   const filtered = useMemo(() => {
     return requests
@@ -186,9 +184,63 @@ export function RequestsView() {
           }
         />
       ) : (
+        <>
+        <BulkActionBar
+          selectedCount={selected.size}
+          onClear={() => setSelected(new Set())}
+          actions={[
+            { label: "Approve", icon: Check, onClick: () => { bulkUpdate(Array.from(selected), "APPROVED"); toast.success(`${selected.size} request(s) approved`); setSelected(new Set()); } },
+            { label: "Cancel", icon: Ban, onClick: () => { bulkUpdate(Array.from(selected), "CANCELLED"); toast.info(`${selected.size} request(s) cancelled`); setSelected(new Set()); }, variant: "danger" },
+            { label: "Export", icon: Download, onClick: async () => {
+              const csvData = Array.from(selected).map((id) => {
+                const r = requests.find((x) => x.id === id);
+                if (!r) return {};
+                const requester = users.find((u) => u.id === r.requestedById);
+                return {
+                  requestNumber: r.requestNumber,
+                  title: r.title,
+                  requester: requester?.name ?? "",
+                  priority: r.priority,
+                  status: r.status,
+                  totalEstimated: r.totalEstimated,
+                  currency: r.currency,
+                  createdAt: r.createdAt,
+                };
+              });
+              try {
+                const res = await fetch("/api/export?XTransformPort=3001", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ type: "requests", data: csvData, format: "csv" }),
+                });
+                if (res.ok) {
+                  const blob = await res.blob();
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a");
+                  a.href = url;
+                  a.download = `nextmav-requests-${new Date().toISOString().slice(0, 10)}.csv`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                  toast.success("CSV exported", { description: `${selected.size} request(s) exported` });
+                }
+              } catch {
+                toast.error("Export failed");
+              }
+              setSelected(new Set());
+            } },
+          ]}
+        />
         <div className="rounded-xl border border-border bg-card overflow-hidden">
           {/* Header row (desktop) */}
           <div className="hidden md:grid grid-cols-12 gap-3 px-5 py-3 border-b border-border bg-muted/30 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+            <div className="col-span-1 flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={selected.size === filtered.length && filtered.length > 0}
+                onChange={(e) => setSelected(e.target.checked ? new Set(filtered.map((r) => r.id)) : new Set())}
+                className="h-4 w-4 rounded border-border"
+              />
+            </div>
             <div className="col-span-4">Request</div>
             <div className="col-span-2">Requester</div>
             <div className="col-span-1">Priority</div>
@@ -201,12 +253,29 @@ export function RequestsView() {
             {filtered.map((r) => {
               const requester = users.find((u) => u.id === r.requestedById);
               const dept = departments.find((d) => d.id === r.departmentId);
+              const isSelected = selected.has(r.id);
               return (
-                <button
+                <div
                   key={r.id}
+                  className={cn(
+                    "w-full grid grid-cols-1 md:grid-cols-12 gap-3 px-5 py-3.5 hover:bg-muted/30 transition-colors text-left items-center group cursor-pointer",
+                    isSelected && "bg-emerald-50/40 dark:bg-emerald-950/15"
+                  )}
                   onClick={() => handleRowClick(r.id)}
-                  className="w-full grid grid-cols-1 md:grid-cols-12 gap-3 px-5 py-3.5 hover:bg-muted/30 transition-colors text-left items-center group"
                 >
+                  <div className="md:col-span-1 flex items-center" onClick={(e) => e.stopPropagation()}>
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      onChange={(e) => {
+                        const next = new Set(selected);
+                        if (e.target.checked) next.add(r.id);
+                        else next.delete(r.id);
+                        setSelected(next);
+                      }}
+                      className="h-4 w-4 rounded border-border"
+                    />
+                  </div>
                   <div className="md:col-span-4 min-w-0">
                     <p className="text-sm font-medium text-foreground truncate group-hover:text-emerald-600 dark:group-hover:text-emerald-400 transition-colors">
                       {r.title}
@@ -236,11 +305,12 @@ export function RequestsView() {
                       {formatCurrency(r.totalEstimated, r.currency)}
                     </span>
                   </div>
-                </button>
+                </div>
               );
             })}
           </div>
         </div>
+        </>
       )}
     </div>
   );

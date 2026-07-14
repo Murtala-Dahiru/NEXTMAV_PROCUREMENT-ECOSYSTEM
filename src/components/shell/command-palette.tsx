@@ -2,31 +2,25 @@
 
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect } from "react";
 import {
+  ArrowRight,
+  BarChart3,
+  Bot,
   ClipboardList,
   FileText,
+  GitBranch,
   Package,
-  Search,
+  Plug,
+  ShieldCheck,
   Users,
-  ArrowRight,
+  Wallet,
   type LucideIcon,
 } from "lucide-react";
 import { CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandSeparator } from "@/components/ui/command";
 import { useStore, type ViewKey } from "@/lib/store";
 import { formatCurrency, formatRelativeTime } from "@/lib/format";
 import { Avatar, PriorityBadge, StatusBadge } from "@/components/shared";
-
-interface SearchResult {
-  id: string;
-  type: "request" | "vendor" | "po" | "rfq" | "navigation";
-  label: string;
-  description: string;
-  icon: LucideIcon;
-  action: () => void;
-  badge?: React.ReactNode;
-  meta?: string;
-}
 
 export function CommandPalette() {
   const open = useStore((s) => s.commandOpen);
@@ -35,13 +29,13 @@ export function CommandPalette() {
   const selectRequest = useStore((s) => s.selectRequest);
   const selectRfq = useStore((s) => s.selectRfq);
   const selectPo = useStore((s) => s.selectPo);
+  const selectVendor = useStore((s) => s.selectVendor);
   const requests = useStore((s) => s.requests);
   const vendors = useStore((s) => s.vendors);
   const purchaseOrders = useStore((s) => s.purchaseOrders);
   const rfqs = useStore((s) => s.rfqs);
   const users = useStore((s) => s.users);
 
-  // Keyboard shortcut
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
@@ -56,16 +50,31 @@ export function CommandPalette() {
 
   const navItems: { label: string; view: ViewKey; icon: LucideIcon; hint: string }[] = [
     { label: "Dashboard", view: "dashboard", icon: ArrowRight, hint: "Go to overview" },
+    { label: "Executive Command Center", view: "command-center", icon: BarChart3, hint: "Executive workspace" },
     { label: "Create new Purchase Request", view: "request-new", icon: ArrowRight, hint: "Start a new requisition" },
     { label: "Create new RFQ", view: "rfq-new", icon: ArrowRight, hint: "Solicit vendor quotations" },
-    { label: "View Vendors", view: "vendors", icon: ArrowRight, hint: "Manage vendor directory" },
-    { label: "View Purchase Orders", view: "purchase-orders", icon: ArrowRight, hint: "All POs" },
-    { label: "View Reports", view: "reports", icon: ArrowRight, hint: "Spend analytics" },
+    { label: "Request Templates", view: "request-templates", icon: FileText, hint: "Reusable templates" },
+    { label: "Approvals Queue", view: "approvals", icon: ArrowRight, hint: "Pending approvals" },
+    { label: "Supplier Portal", view: "supplier-portal", icon: Users, hint: "Vendor portal access" },
+    { label: "Goods Receiving", view: "goods-receipts", icon: Package, hint: "Receive deliveries" },
+    { label: "Invoices", view: "invoices", icon: FileText, hint: "Invoice tracking" },
+    { label: "Payments", view: "payments", icon: Wallet, hint: "Payment tracking" },
+    { label: "Contracts", view: "contracts", icon: FileText, hint: "Contract management" },
+    { label: "Assets", view: "assets", icon: Package, hint: "Asset management" },
+    { label: "Inventory", view: "inventory", icon: Package, hint: "Stock management" },
+    { label: "Documents", view: "documents", icon: FileText, hint: "Document repository" },
+    { label: "Budget Management", view: "budgets", icon: Wallet, hint: "Track spend" },
+    { label: "AI Procurement Assistant", view: "ai-assistant", icon: Bot, hint: "Ask AI anything" },
+    { label: "Audit & Security Center", view: "audit", icon: ShieldCheck, hint: "Audit trail" },
+    { label: "Approval Workflows", view: "settings-workflows", icon: GitBranch, hint: "Configure workflows" },
+    { label: "Roles & Permissions", view: "settings-roles", icon: Users, hint: "Manage access" },
+    { label: "Integrations", view: "integrations", icon: Plug, hint: "Connect tools" },
+    { label: "Reports & Analytics", view: "reports", icon: ArrowRight, hint: "Spend analytics" },
   ];
 
   return (
     <CommandDialog open={open} onOpenChange={setOpen} className="max-w-2xl">
-      <CommandInput placeholder="Search requests, vendors, POs, RFQs… or jump to a page" />
+      <CommandInput placeholder="Search requests, vendors, POs, RFQs, or jump to a page… (Press ? for shortcuts)" />
       <CommandList>
         <CommandEmpty>No results found.</CommandEmpty>
 
@@ -121,7 +130,8 @@ export function CommandPalette() {
               <CommandItem
                 key={v.id}
                 onSelect={() => {
-                  navigate("vendors");
+                  selectVendor(v.id);
+                  navigate("vendor-detail");
                   setOpen(false);
                 }}
               >
@@ -130,7 +140,7 @@ export function CommandPalette() {
                   <p className="truncate text-sm">{v.companyName}</p>
                   <p className="text-xs text-muted-foreground truncate">{v.category} · {v.contactPerson}</p>
                 </div>
-                <span className="text-xs text-muted-foreground">{v.rating > 0 ? v.rating.toFixed(1) : "New"}</span>
+                <span className="text-xs text-muted-foreground">{v.rating > 0 ? `★ ${v.rating.toFixed(1)}` : "New"}</span>
               </CommandItem>
             ))}
           </CommandGroup>

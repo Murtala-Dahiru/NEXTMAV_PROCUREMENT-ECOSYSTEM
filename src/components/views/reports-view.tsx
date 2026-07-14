@@ -102,13 +102,114 @@ export function ReportsView() {
         title="Reports & Analytics"
         description="Spend intelligence and procurement KPIs across your organization."
         actions={
-          <button
-            onClick={() => toast.info("Export ready", { description: "Report exported as PDF." })}
-            className="inline-flex h-9 items-center gap-2 rounded-lg bg-primary px-3.5 text-sm font-medium text-primary-foreground hover:opacity-95 transition-opacity"
-          >
-            <Download size={15} />
-            Export Report
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={async () => {
+                const csvData = purchaseOrders.map((p) => ({
+                  poNumber: p.poNumber,
+                  vendor: vendors.find((v) => v.id === p.vendorId)?.companyName ?? "",
+                  status: p.status,
+                  total: p.totalAmount,
+                  currency: p.currency,
+                  issuedAt: p.issuedAt,
+                  expectedDelivery: p.expectedDelivery,
+                }));
+                try {
+                  const res = await fetch("/api/export?XTransformPort=3001", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ type: "purchase_orders", data: csvData, format: "csv" }),
+                  });
+                  if (res.ok) {
+                    const blob = await res.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `nextmav-pos-${new Date().toISOString().slice(0, 10)}.csv`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                    toast.success("CSV exported", { description: `${csvData.length} purchase orders exported.` });
+                  }
+                } catch {
+                  toast.error("Export failed");
+                }
+              }}
+              className="inline-flex h-9 items-center gap-2 rounded-lg border border-border bg-card px-3 text-sm font-medium hover:bg-muted transition-colors"
+            >
+              <Download size={14} /> CSV
+            </button>
+            <button
+              onClick={async () => {
+                const jsonData = {
+                  generatedAt: new Date().toISOString(),
+                  organization: "Apex Industries",
+                  summary: { totalSpend, totalPOs: purchaseOrders.length, totalVendors: vendors.length, avgPoValue },
+                  purchaseOrders: purchaseOrders.map((p) => ({
+                    ...p,
+                    vendorName: vendors.find((v) => v.id === p.vendorId)?.companyName,
+                  })),
+                  vendors: vendors.map((v) => ({ id: v.id, name: v.companyName, rating: v.rating, totalValue: v.totalValue, status: v.status })),
+                  departments: departments.map((d) => ({ name: d.name, budget: d.budget, spent: d.spent })),
+                };
+                try {
+                  const res = await fetch("/api/export?XTransformPort=3001", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ type: "full_report", data: [jsonData], format: "json" }),
+                  });
+                  if (res.ok) {
+                    const blob = await res.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `nextmav-report-${new Date().toISOString().slice(0, 10)}.json`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                    toast.success("JSON exported", { description: "Full report downloaded." });
+                  }
+                } catch {
+                  toast.error("Export failed");
+                }
+              }}
+              className="inline-flex h-9 items-center gap-2 rounded-lg border border-border bg-card px-3 text-sm font-medium hover:bg-muted transition-colors"
+            >
+              <Download size={14} /> JSON
+            </button>
+            <button
+              onClick={async () => {
+                const csvData = [
+                  { metric: "Total Spend YTD", value: totalSpend },
+                  { metric: "Total POs", value: purchaseOrders.length },
+                  { metric: "Total Vendors", value: vendors.length },
+                  { metric: "Avg PO Value", value: avgPoValue.toFixed(2) },
+                  { metric: "Approval Rate", value: `${approvalRate}%` },
+                  { metric: "Cost Savings", value: totalSaved },
+                ];
+                try {
+                  const res = await fetch("/api/export?XTransformPort=3001", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ type: "report_summary", data: csvData, format: "csv" }),
+                  });
+                  if (res.ok) {
+                    const blob = await res.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `nextmav-report-${new Date().toISOString().slice(0, 10)}.csv`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                    toast.success("Report exported", { description: "Executive summary downloaded as CSV" });
+                  }
+                } catch {
+                  toast.error("Export failed");
+                }
+              }}
+              className="inline-flex h-9 items-center gap-2 rounded-lg bg-primary px-3.5 text-sm font-medium text-primary-foreground hover:opacity-95 transition-opacity"
+            >
+              <Download size={15} /> PDF Summary
+            </button>
+          </div>
         }
       />
 
@@ -126,7 +227,34 @@ export function ReportsView() {
           {reportTypes.map((r) => (
             <button
               key={r.label}
-              onClick={() => toast.info("Generating report", { description: `${r.label} report is being prepared.` })}
+              onClick={async () => {
+                const reportData = purchaseOrders.map((p) => ({
+                  poNumber: p.poNumber,
+                  vendor: vendors.find((v) => v.id === p.vendorId)?.companyName ?? "",
+                  status: p.status,
+                  total: p.totalAmount,
+                  issuedAt: p.issuedAt,
+                }));
+                try {
+                  const res = await fetch("/api/export?XTransformPort=3001", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ type: r.label.toLowerCase().replace(/\s+/g, "_"), data: reportData, format: "csv" }),
+                  });
+                  if (res.ok) {
+                    const blob = await res.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `${r.label.toLowerCase().replace(/\s+/g, "-")}-${new Date().toISOString().slice(0, 10)}.csv`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                    toast.success(`${r.label} exported`, { description: `${reportData.length} records downloaded` });
+                  }
+                } catch {
+                  toast.error("Export failed");
+                }
+              }}
               className="group flex items-center gap-3 rounded-lg border border-border bg-card p-3 hover:bg-muted/40 hover:border-emerald-300 transition-all text-left"
             >
               <div className={`flex h-9 w-9 items-center justify-center rounded-lg ${r.color}`}>

@@ -8,6 +8,7 @@ import {
   Filter,
   Mail,
   MapPin,
+  Pencil,
   Phone,
   Plus,
   Search,
@@ -79,6 +80,11 @@ export function VendorsView() {
   const openEditVendor = (v: Vendor) => {
     setEditingVendor(v);
     setShowForm(true);
+  };
+
+  const openVendorDetail = (v: Vendor) => {
+    useStore.getState().selectVendor(v.id);
+    navigate("vendor-detail");
   };
 
   return (
@@ -165,7 +171,7 @@ export function VendorsView() {
             <div
               key={v.id}
               className="group rounded-xl border border-border bg-card p-5 hover:shadow-md hover:shadow-foreground/[0.03] hover:-translate-y-0.5 transition-all cursor-pointer"
-              onClick={() => openEditVendor(v)}
+              onClick={() => openVendorDetail(v)}
             >
               <div className="flex items-start justify-between gap-3">
                 <div className="flex items-center gap-3 min-w-0 flex-1">
@@ -210,6 +216,17 @@ export function VendorsView() {
                   </p>
                 </div>
               </div>
+
+              {/* Edit button overlay on hover */}
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openEditVendor(v);
+                }}
+                className="mt-3 w-full inline-flex h-7 items-center justify-center gap-1 rounded-md border border-border bg-card text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted transition-colors opacity-0 group-hover:opacity-100"
+              >
+                <Pencil size={11} /> Edit
+              </button>
             </div>
           ))}
         </div>
@@ -225,7 +242,7 @@ export function VendorsView() {
               updateVendor(editingVendor.id, data);
               toast.success("Vendor updated", { description: `${data.companyName} has been updated.` });
             } else {
-              createVendor(data);
+              createVendor(data as any);
               toast.success("Vendor added", { description: `${data.companyName} has been added to your directory.` });
             }
             setShowForm(false);
