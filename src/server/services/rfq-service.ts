@@ -67,9 +67,9 @@ export async function list(ctx: ServiceContext, q: ListInput): Promise<Page<unkn
   if (q.status && q.status !== "ALL") where.status = { in: q.status.split(",") as RFQStatus[] };
   if (q.search) {
     where.OR = [
-      { rfqNumber: { contains: q.search } },
-      { title: { contains: q.search } },
-      { description: { contains: q.search } },
+      { rfqNumber: { contains: q.search, mode: "insensitive" } },
+      { title: { contains: q.search, mode: "insensitive" } },
+      { description: { contains: q.search, mode: "insensitive" } },
     ];
   }
 

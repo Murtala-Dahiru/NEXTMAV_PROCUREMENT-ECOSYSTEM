@@ -94,10 +94,10 @@ export async function list(ctx: ServiceContext, q: ListInput): Promise<Page<unkn
   if (q.vendorId && q.vendorId !== "ALL") where.vendorId = q.vendorId;
   if (q.search) {
     where.OR = [
-      { paymentNumber: { contains: q.search } },
-      { reference: { contains: q.search } },
-      { vendor: { companyName: { contains: q.search } } },
-      { invoice: { invoiceNumber: { contains: q.search } } },
+      { paymentNumber: { contains: q.search, mode: "insensitive" } },
+      { reference: { contains: q.search, mode: "insensitive" } },
+      { vendor: { companyName: { contains: q.search, mode: "insensitive" } } },
+      { invoice: { invoiceNumber: { contains: q.search, mode: "insensitive" } } },
     ];
   }
 

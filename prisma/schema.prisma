@@ -13,8 +13,16 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
-  url      = env("DATABASE_URL")
+  provider = "postgresql"
+
+  // Pooled connection, used by the application at runtime. On Vercel every
+  // request may land in a new serverless container, so connections must come
+  // from a pooler rather than opening a direct one each time.
+  url = env("DATABASE_URL")
+
+  // Unpooled connection, used only by migrations. Schema changes need a real
+  // session, which a transaction-mode pooler cannot provide.
+  directUrl = env("DIRECT_DATABASE_URL")
 }
 
 // ===========================================================================

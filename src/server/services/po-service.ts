@@ -118,9 +118,9 @@ export async function list(ctx: ServiceContext, q: ListInput): Promise<Page<unkn
   }
   if (q.search) {
     where.OR = [
-      { poNumber: { contains: q.search } },
-      { vendor: { companyName: { contains: q.search } } },
-      { lineItems: { some: { itemName: { contains: q.search } } } },
+      { poNumber: { contains: q.search, mode: "insensitive" } },
+      { vendor: { companyName: { contains: q.search, mode: "insensitive" } } },
+      { lineItems: { some: { itemName: { contains: q.search, mode: "insensitive" } } } },
     ];
   }
 
