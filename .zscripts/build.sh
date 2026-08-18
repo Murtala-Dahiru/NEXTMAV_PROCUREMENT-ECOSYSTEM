@@ -35,9 +35,10 @@ mkdir -p "$BUILD_DIR"
 echo "📦 安装依赖..."
 bun install
 
-# 构建 Next.js 应用
+# 构建 Next.js 应用（standalone 输出，供自托管打包使用）
+# 注意：Vercel 部署走 `npm run build`（普通输出）；此处必须使用 standalone。
 echo "🔨 构建 Next.js 应用..."
-bun run build
+bun run build:standalone
 
 # 构建 mini-services
 # 检查 Next.js 项目目录下是否有 mini-services 目录
