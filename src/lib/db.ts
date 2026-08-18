@@ -1,13 +1,4 @@
-import { PrismaClient } from '@prisma/client'
-
-const globalForPrisma = globalThis as unknown as {
-  prisma: PrismaClient | undefined
-}
-
-export const db =
-  globalForPrisma.prisma ??
-  new PrismaClient({
-    log: ['query'],
-  })
-
-if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = db
+// Kept as a compatibility re-export. The Prisma client singleton now lives in
+// `src/server/db.ts` alongside the tenancy guard, so that server-only code is not
+// reachable from `src/lib`, which the client bundle imports.
+export { db } from "@/server/db";

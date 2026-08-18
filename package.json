@@ -10,7 +10,13 @@
     "db:push": "prisma db push",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
-    "db:reset": "prisma migrate reset"
+    "db:reset": "prisma migrate reset",
+    "db:seed": "node --experimental-strip-types prisma/seed.ts",
+    "db:studio": "prisma studio",
+    "typecheck": "tsc --noEmit",
+    "verify:tenancy": "node scripts/verify/tenancy.mjs",
+    "verify:journeys": "node scripts/verify/journeys.mjs",
+    "verify:ui": "node scripts/verify/ui-mutations.mjs"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
@@ -91,5 +97,8 @@
     "tailwindcss": "^4",
     "tw-animate-css": "^1.3.5",
     "typescript": "^5"
+  },
+  "prisma": {
+    "seed": "node --experimental-strip-types prisma/seed.ts"
   }
 }

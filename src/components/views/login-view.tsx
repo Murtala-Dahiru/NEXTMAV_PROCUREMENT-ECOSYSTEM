@@ -6,6 +6,7 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
 import {
+  AlertCircle,
   ArrowRight,
   BarChart3,
   CheckCircle2,
@@ -21,16 +22,44 @@ import { useStore } from "@/lib/store";
 import { Avatar } from "@/components/shared";
 import { seedUsers } from "@/lib/seed-data";
 
+/**
+ * Shared password for the seeded demo accounts, used by the "Or try as" quick
+ * switcher below. This is a development convenience tied to `prisma/seed.ts`;
+ * it is not a bypass — the click performs a real credential login against the
+ * server exactly as typing them would.
+ */
+const DEMO_PASSWORD = "NextMav#2026";
+
 export function LoginView() {
   const login = useStore((s) => s.login);
   const [loading, setLoading] = useState(false);
-  const [email, setEmail] = useState("amina.okafor@apex.com");
-  const [password, setPassword] = useState("•••••••••");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const signIn = async (withEmail: string, withPassword: string) => {
+    setError(null);
+    setLoading(true);
+    try {
+      await login(withEmail, withPassword);
+    } catch (err) {
+      const { ApiError } = await import("@/lib/api/client");
+      setError(
+        err instanceof ApiError
+          ? err.message
+          : "Could not reach the server. Check your connection and try again."
+      );
+      setLoading(false);
+    }
+  };
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
-    setLoading(true);
-    setTimeout(() => login(), 700);
+    if (!email.trim() || !password) {
+      setError("Enter your email and password to sign in.");
+      return;
+    }
+    void signIn(email.trim(), password);
   };
 
   return (
@@ -129,6 +158,16 @@ export function LoginView() {
             <p className="mt-1 text-sm text-muted-foreground">Sign in to your organization&apos;s workspace</p>
           </div>
 
+          {error && (
+            <div
+              role="alert"
+              className="mb-4 flex items-start gap-2.5 rounded-lg border border-rose-200 bg-rose-50 px-3.5 py-3 text-sm text-rose-800 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-300"
+            >
+              <AlertCircle size={16} className="mt-0.5 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
+
           <form onSubmit={handleLogin} className="space-y-4">
             <div className="space-y-1.5">
               <label htmlFor="email" className="text-sm font-medium text-foreground">Work email</label>
@@ -137,8 +176,11 @@ export function LoginView() {
                 <input
                   id="email"
                   type="email"
+                  autoComplete="username"
+                  required
+                  disabled={loading}
                   value={email}
-                  onChange={(e) => setEmail(e.target.value)}
+                  onChange={(e) => { setEmail(e.target.value); setError(null); }}
                   className="w-full h-10 rounded-lg border border-input bg-background pl-10 pr-3 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent transition-all"
                   placeholder="you@company.com"
                 />
@@ -157,8 +199,11 @@ export function LoginView() {
                 <input
                   id="password"
                   type="password"
+                  autoComplete="current-password"
+                  required
+                  disabled={loading}
                   value={password}
-                  onChange={(e) => setPassword(e.target.value)}
+                  onChange={(e) => { setPassword(e.target.value); setError(null); }}
                   className="w-full h-10 rounded-lg border border-input bg-background pl-10 pr-3 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent transition-all"
                   placeholder="••••••••"
                 />
@@ -194,11 +239,10 @@ export function LoginView() {
             {seedUsers.slice(0, 6).map((u) => (
               <button
                 key={u.id}
-                onClick={() => {
-                  setLoading(true);
-                  setTimeout(() => login(u.id), 400);
-                }}
-                className="group flex w-full items-center gap-3 rounded-lg border border-border bg-card px-3 py-2 text-left hover:border-emerald-300 hover:bg-emerald-50/40 dark:hover:bg-emerald-950/20 transition-all"
+                type="button"
+                disabled={loading}
+                onClick={() => void signIn(u.email, DEMO_PASSWORD)}
+                className="group flex w-full items-center gap-3 rounded-lg border border-border bg-card px-3 py-2 text-left hover:border-emerald-300 hover:bg-emerald-50/40 dark:hover:bg-emerald-950/20 transition-all disabled:opacity-50 disabled:pointer-events-none"
               >
                 <Avatar initials={u.initials} color={u.avatarColor} size="sm" />
                 <div className="min-w-0 flex-1">

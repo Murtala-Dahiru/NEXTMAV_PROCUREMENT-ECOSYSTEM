@@ -43,7 +43,7 @@ export function RfqFormView() {
     );
   };
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (!title.trim()) {
       toast.error("Title required");
       return;
@@ -56,16 +56,17 @@ export function RfqFormView() {
       toast.error("Select at least one vendor");
       return;
     }
-    const id = createRFQ({
+    const { mutate } = await import("@/lib/api/client");
+    const id = await mutate(() => createRFQ({
       title: title.trim(),
       description: description.trim(),
       deadline: new Date(deadline).toISOString(),
       invitedVendorIds: selectedVendorIds,
       requestId: linkedRequestId || undefined,
+    }), {
+      success: `RFQ issued to ${selectedVendorIds.length} supplier${selectedVendorIds.length !== 1 ? "s" : ""}`,
     });
-    toast.success("RFQ created", {
-      description: `Issued to ${selectedVendorIds.length} vendor${selectedVendorIds.length !== 1 ? "s" : ""}.`,
-    });
+    if (!id) return;
     useStore.getState().selectRfq(id);
     navigate("rfq-detail");
   };

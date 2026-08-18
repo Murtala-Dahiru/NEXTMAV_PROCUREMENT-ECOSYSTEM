@@ -69,11 +69,12 @@ export function RfqDetailView() {
     });
   };
 
-  const handleGeneratePO = () => {
+  const handleGeneratePO = async () => {
     if (!selectedQuote) return;
     const vendor = vendors.find((v) => v.id === selectedQuote.vendorId);
     const linkedReq = requests.find((r) => r.id === rfq.requestId);
-    const poId = generatePO({
+    const { mutate } = await import("@/lib/api/client");
+    const poId = await mutate(() => generatePO({
       requestId: rfq.requestId,
       rfqId: rfq.id,
       quotationId: selectedQuote.id,
@@ -90,10 +91,8 @@ export function RfqDetailView() {
       ],
       notes: `Auto-generated from ${rfq.rfqNumber}. Vendor: ${vendor?.companyName}. Delivery: ${selectedQuote.deliveryDays} days. Payment: ${selectedQuote.paymentTerms}.`,
       expectedDelivery: new Date(Date.now() + selectedQuote.deliveryDays * 86400000).toISOString(),
-    });
-    toast.success("Purchase Order generated", {
-      description: `PO has been issued to ${vendor?.companyName}.`,
-    });
+    }), { success: `Purchase order issued to ${vendor?.companyName}` });
+    if (!poId) return;
     useStore.getState().selectPo(poId);
     navigate("po-detail");
   };

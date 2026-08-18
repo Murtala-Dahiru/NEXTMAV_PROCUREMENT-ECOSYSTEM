@@ -377,6 +377,12 @@ export interface ApprovalStep {
   id: string;
   requestId: string;
   stage: ApprovalStage;
+  /**
+   * Position in the approval chain. Steps sharing a sequence run in parallel and
+   * must all approve before the chain advances. Optional because historical rows
+   * created before the workflow engine do not carry one.
+   */
+  sequence?: number;
   approverId: string;
   approverRole: UserRole;
   decision: ApprovalDecision;

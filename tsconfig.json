@@ -10,6 +10,9 @@
     "skipLibCheck": true,
     "strict": true,
     "noEmit": true,
+    // Node's native type stripping runs prisma/seed.ts directly, which requires
+    // explicit .ts specifiers on its relative imports.
+    "allowImportingTsExtensions": true,
     "noImplicitAny": false,
     "esModuleInterop": true,
     "module": "esnext",
@@ -37,6 +40,9 @@
     ".next/dev/types/**/*.ts"
   ],
   "exclude": [
-    "node_modules"
+    "node_modules",
+    "mini-services",
+    "examples",
+    "scripts/verify"
   ]
 }

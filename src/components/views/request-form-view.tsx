@@ -36,6 +36,7 @@ interface LineItemDraft {
 }
 
 export function RequestFormView() {
+  const [saving, setSaving] = useState(false);
   const navigate = useStore((s) => s.navigate);
   const createRequest = useStore((s) => s.createRequest);
   const departments = useStore((s) => s.departments);
@@ -87,10 +88,13 @@ export function RequestFormView() {
     return true;
   };
 
-  const handleSubmit = (submit: boolean) => {
+  const handleSubmit = async (submit: boolean) => {
     if (!validate()) return;
+    if (saving) return;
     const validItems = lineItems.filter((li) => li.itemName.trim() && li.quantity > 0);
-    const id = createRequest({
+    setSaving(true);
+    const { mutate } = await import("@/lib/api/client");
+    const id = await mutate(() => createRequest({
       title: title.trim(),
       departmentId,
       priority,
@@ -100,10 +104,13 @@ export function RequestFormView() {
       neededByDate: new Date(neededByDate).toISOString(),
       lineItems: validItems.map(({ id: _id, ...rest }) => rest),
       submit,
+    }), {
+      success: submit
+        ? `${title} submitted for approval`
+        : `${title} saved as draft`,
     });
-    toast.success(submit ? "Request submitted" : "Draft saved", {
-      description: `${title} has been ${submit ? "submitted for approval" : "saved as draft"}.`,
-    });
+    setSaving(false);
+    if (!id) return;
     useStore.getState().selectRequest(id);
     navigate("request-detail");
   };

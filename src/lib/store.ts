@@ -123,6 +123,14 @@ export type ViewKey =
 interface AppState {
   // Auth/session
   isAuthed: boolean;
+  /** False until restoreSession() has run, so the shell can hold the first paint. */
+  sessionChecked: boolean;
+  /** True once organization data has been loaded from the server. */
+  hydrated: boolean;
+  loading: boolean;
+  loadError: string | null;
+  /** Server-resolved permissions for the signed-in user. Advisory for rendering only. */
+  permissions: Permission[];
   currentUserId: string;
   theme: "light" | "dark";
   sidebarCollapsed: boolean;
@@ -176,8 +184,14 @@ interface AppState {
   roleOverrides: Record<UserRole, Permission[]>;
 
   // Actions — auth & theme
-  login: (userId?: string) => void;
-  logout: () => void;
+  login: (email: string, password: string) => Promise<void>;
+  logout: () => Promise<void>;
+  /** Loads organization data from the server. Replaces the seed-data import. */
+  hydrate: () => Promise<void>;
+  /** Re-reads server state after a mutation. */
+  refresh: () => Promise<void>;
+  /** Restores an existing session on page load. */
+  restoreSession: () => Promise<void>;
   setTheme: (t: "light" | "dark") => void;
   toggleTheme: () => void;
   toggleSidebar: () => void;
@@ -216,18 +230,18 @@ interface AppState {
     lineItems: Omit<LineItem, "id">[];
     submit: boolean;
     templateId?: string;
-  }) => string;
-  approveRequest: (requestId: string, decision: "APPROVED" | "REJECTED" | "CHANGES_REQUESTED", comment: string) => void;
-  submitRequest: (requestId: string) => void;
-  cancelRequest: (requestId: string) => void;
+  }) => Promise<string>;
+  approveRequest: (requestId: string, decision: "APPROVED" | "REJECTED" | "CHANGES_REQUESTED", comment: string) => Promise<void>;
+  submitRequest: (requestId: string) => Promise<void>;
+  cancelRequest: (requestId: string, reason?: string) => Promise<void>;
   duplicateRequest: (requestId: string) => string;
   bulkUpdateRequestStatus: (ids: string[], status: PurchaseRequest["status"]) => void;
-  addComment: (entityType: Comment["entityType"], entityId: string, content: string, mentions?: string[]) => void;
+  addComment: (entityType: Comment["entityType"], entityId: string, content: string, mentions?: string[]) => Promise<void>;
   addWatcher: (requestId: string, userId: string) => void;
 
   // Actions — templates
   createTemplate: (data: Omit<RequestTemplate, "id" | "organizationId" | "usageCount" | "createdBy" | "createdAt">) => void;
-  useTemplate: (templateId: string) => void;
+  useTemplate: (templateId: string) => Promise<void>;
 
   // Actions — vendors
   createVendor: (data: Omit<Vendor, "id" | "organizationId" | "createdAt" | "rating" | "status" | "totalOrders" | "totalValue" | "documents" | "complianceScore" | "onTimeDeliveryRate" | "qualityRating" | "tags" | "notes">) => void;
@@ -244,13 +258,13 @@ interface AppState {
     deadline: string;
     invitedVendorIds: string[];
     requestId?: string;
-  }) => string;
+  }) => Promise<string>;
   cancelRFQ: (rfqId: string) => void;
   duplicateRFQ: (rfqId: string) => string;
   sendRFQReminder: (rfqId: string) => void;
 
   // Actions — quotations
-  selectQuotation: (rfqId: string, quotationId: string) => void;
+  selectQuotation: (rfqId: string, quotationId: string) => Promise<void>;
 
   // Actions — POs
   generatePO: (data: {
@@ -263,7 +277,7 @@ interface AppState {
     expectedDelivery: string;
     taxRate?: number;
     currency?: PurchaseOrder["currency"];
-  }) => string;
+  }) => Promise<string>;
   updatePOStatus: (poId: string, status: PurchaseOrderStatus) => void;
   revisePO: (poId: string, reason: string, changes: Partial<PurchaseOrder>) => void;
 
@@ -296,17 +310,17 @@ interface AppState {
   updateOrganization: (changes: Partial<Organization>) => void;
 
   // Actions — goods receipts
-  createGoodsReceipt: (data: { poId: string; vendorId: string; notes?: string; items: { lineItemId: string; itemName: string; orderedQty: number; receivedQty: number; unit: string; condition: "GOOD" | "DAMAGED" | "MISSING"; notes?: string }[] }) => string;
+  createGoodsReceipt: (data: { poId: string; vendorId: string; notes?: string; items: { lineItemId: string; itemName: string; orderedQty: number; receivedQty: number; unit: string; condition: "GOOD" | "DAMAGED" | "MISSING"; notes?: string }[] }) => Promise<string>;
   updateGoodsReceiptStatus: (id: string, status: GoodsReceiptStatus) => void;
 
   // Actions — invoices
-  createInvoice: (data: { vendorId: string; poId?: string; issueDate: string; dueDate: string; subtotal: number; taxAmount: number; notes?: string }) => string;
-  approveInvoice: (id: string) => void;
-  rejectInvoice: (id: string, reason: string) => void;
+  createInvoice: (data: { vendorId: string; poId?: string; issueDate: string; dueDate: string; subtotal: number; taxAmount: number; notes?: string }) => Promise<string>;
+  approveInvoice: (id: string) => Promise<void>;
+  rejectInvoice: (id: string, reason: string) => Promise<void>;
   updateInvoiceStatus: (id: string, status: InvoiceStatus) => void;
 
   // Actions — payments
-  createPayment: (data: { invoiceId: string; vendorId: string; amount: number; method: PaymentMethod; paymentDate: string; reference?: string; notes?: string }) => string;
+  createPayment: (data: { invoiceId: string; vendorId: string; amount: number; method: PaymentMethod; paymentDate: string; reference?: string; notes?: string }) => Promise<string>;
   updatePaymentStatus: (id: string, status: PaymentStatus) => void;
 
   // Actions — contracts
@@ -338,8 +352,49 @@ interface AppState {
   deleteDocument: (id: string) => void;
 }
 
+/**
+ * Empty domain state.
+ *
+ * The store used to boot from `seed-data.ts`, which is why the app showed a
+ * fully populated dashboard before any request was made and why every change
+ * vanished on refresh. It now starts empty and is filled by `hydrate()` from
+ * the database. `seed-data.ts` is still the source of the demo dataset, but it
+ * is loaded once by `prisma/seed.ts` into real rows.
+ */
+const emptyDomainState = {
+  branches: [] as Branch[],
+  departments: [] as Department[],
+  users: [] as User[],
+  vendors: [] as Vendor[],
+  requests: [] as PurchaseRequest[],
+  rfqs: [] as RFQ[],
+  purchaseOrders: [] as PurchaseOrder[],
+  activities: [] as ActivityLog[],
+  notifications: [] as Notification[],
+  workflows: [] as ApprovalWorkflow[],
+  budgets: [] as Budget[],
+  templates: [] as RequestTemplate[],
+  integrations: [] as Integration[],
+  auditLogs: [] as AuditLogEntry[],
+  savedViews: [] as SavedView[],
+  goodsReceipts: [] as GoodsReceipt[],
+  invoices: [] as Invoice[],
+  payments: [] as Payment[],
+  contracts: [] as Contract[],
+  assets: [] as Asset[],
+  inventory: [] as InventoryItem[],
+  supplierPortalUsers: [] as SupplierPortalUser[],
+  supplierActivities: [] as SupplierActivity[],
+  documents: [] as DocumentRecord[],
+  permissions: [] as Permission[],
+};
+
 const initialState = {
   isAuthed: false,
+  sessionChecked: false,
+  hydrated: false,
+  loading: false,
+  loadError: null as string | null,
   currentUserId: "usr_amina",
   theme: "light" as const,
   sidebarCollapsed: false,
@@ -358,33 +413,9 @@ const initialState = {
   shortcutsOpen: false,
   previousView: null as ViewKey | null,
   organization: seedOrganization,
-  branches: seedBranches,
-  departments: seedDepartments,
-  users: seedUsers,
-  vendors: seedVendors,
-  requests: seedRequests,
-  rfqs: seedRFQs,
-  purchaseOrders: seedPurchaseOrders,
-  activities: seedActivities,
-  notifications: seedNotifications,
-  workflows: seedWorkflows,
-  budgets: seedBudgets,
-  templates: seedTemplates,
-  integrations: seedIntegrations,
-  auditLogs: seedAuditLogs,
-  savedViews: [] as SavedView[],
   notificationPreference: seedNotificationPreference,
   roleOverrides: {} as Record<UserRole, Permission[]>,
-  // New enterprise modules
-  goodsReceipts: seedGoodsReceipts,
-  invoices: seedInvoices,
-  payments: seedPayments,
-  contracts: seedContracts,
-  assets: seedAssets,
-  inventory: seedInventory,
-  supplierPortalUsers: seedSupplierPortalUsers,
-  supplierActivities: seedSupplierActivities,
-  documents: seedDocuments,
+  ...emptyDomainState,
 };
 
 // Helper to log activity + audit + notification
@@ -444,32 +475,98 @@ export const useStore = create<AppState>()(
     (set, get) => ({
       ...initialState,
 
-      // Auth
-      login: (userId = "usr_amina") => {
-        set({ isAuthed: true, currentUserId: userId, view: "dashboard" });
-        const user = get().users.find((u) => u.id === userId);
-        if (user) {
+      // Auth — server-backed.
+      //
+      // `login` now verifies credentials against the server and receives an
+      // httpOnly session cookie. The previous implementation simply set
+      // `isAuthed = true` and ignored what the user typed.
+      login: async (email: string, password: string) => {
+        const { api } = await import("./api/client");
+        const result = await api.post<{ user: { id: string } }>("/api/auth/login", {
+          email,
+          password,
+        });
+        set({ isAuthed: true, currentUserId: result.user.id, view: "dashboard" });
+        await get().hydrate();
+      },
+
+      logout: async () => {
+        const { api } = await import("./api/client");
+        // Clear locally regardless of whether the call succeeds — a user pressing
+        // "sign out" must always end up signed out of this browser.
+        try {
+          await api.post("/api/auth/logout");
+        } finally {
           set({
-            users: get().users.map((u) => (u.id === userId ? { ...u, lastLoginAt: new Date().toISOString() } : u)),
-          });
-          logEvent(get, set, {
-            eventType: "USER_LOGIN",
-            description: `${user.name} signed in`,
-            severity: "INFO",
-            userId,
+            isAuthed: false,
+            view: "dashboard",
+            hydrated: false,
+            ...emptyDomainState,
           });
         }
       },
-      logout: () => {
-        const user = get().users.find((u) => u.id === get().currentUserId);
-        if (user) {
-          logEvent(get, set, {
-            eventType: "USER_LOGOUT",
-            description: `${user.name} signed out`,
-            userId: user.id,
+
+      /**
+       * Loads the organization's data from the server.
+       *
+       * This is what replaced `seed-data.ts` as the source of truth. The payload
+       * is shaped by `bootstrap-service.ts` to match the client types exactly,
+       * so every existing view continues to work against it unchanged.
+       */
+      hydrate: async () => {
+        const { api } = await import("./api/client");
+        set({ loading: true, loadError: null });
+        try {
+          const data = await api.get<Record<string, unknown>>("/api/bootstrap");
+          set({
+            ...(data as Partial<AppState>),
+            // A user with no notification preference row falls back to defaults
+            // rather than leaving the settings screen with nothing to render.
+            notificationPreference:
+              (data.notificationPreference as AppState["notificationPreference"]) ??
+              get().notificationPreference,
+            hydrated: true,
+            loading: false,
+            loadError: null,
           });
+        } catch (e) {
+          set({
+            loading: false,
+            loadError: e instanceof Error ? e.message : "Could not load your organization's data",
+          });
+          throw e;
         }
-        set({ isAuthed: false, view: "dashboard" });
+      },
+
+      /** Re-reads server state after a mutation. */
+      refresh: async () => {
+        if (!get().isAuthed) return;
+        try {
+          await get().hydrate();
+        } catch {
+          // hydrate() has already recorded the error for the UI.
+        }
+      },
+
+      /** Restores an existing session on page load, so a refresh keeps you signed in. */
+      restoreSession: async () => {
+        const { api } = await import("./api/client");
+        try {
+          const session = await api.get<{
+            authenticated: boolean;
+            user?: { id: string };
+          }>("/api/auth/session");
+
+          if (!session.authenticated || !session.user) {
+            set({ isAuthed: false, sessionChecked: true });
+            return;
+          }
+
+          set({ isAuthed: true, currentUserId: session.user.id, sessionChecked: true });
+          await get().hydrate();
+        } catch {
+          set({ isAuthed: false, sessionChecked: true });
+        }
       },
 
       // Theme
@@ -557,221 +654,73 @@ export const useStore = create<AppState>()(
       },
 
       // Requests
-      createRequest: (data) => {
-        const seq = get().requests.length + 1;
-        const id = generateId("req");
-        const now = new Date().toISOString();
-        const total = data.lineItems.reduce((s, li) => s + li.quantity * li.estimatedCost, 0);
-        const user = get().users.find((u) => u.id === get().currentUserId)!;
-        const newRequest: PurchaseRequest = {
-          id,
-          organizationId: get().organization.id,
-          requestNumber: generateRequestNumber(seq),
+      createRequest: async (data) => {
+        const { api } = await import("./api/client");
+        const created = await api.post<{ id: string }>("/api/requests", {
           title: data.title,
           departmentId: data.departmentId,
-          requestedById: get().currentUserId,
-          status: data.submit ? "SUBMITTED" : "DRAFT",
           priority: data.priority,
           category: data.category,
           tags: data.tags,
           businessJustification: data.businessJustification,
-          neededByDate: data.neededByDate,
-          totalEstimated: total,
-          currency: "NGN",
-          attachments: [],
-          lineItems: data.lineItems.map((li) => ({ ...li, id: generateId("li") })),
-          approvals: data.submit
-            ? [
-                {
-                  id: generateId("ap"),
-                  requestId: id,
-                  stage: "DEPARTMENT_MANAGER",
-                  approverId: get().users.find((u) => u.role === "DEPARTMENT_MANAGER")?.id ?? "usr_chidi",
-                  approverRole: "DEPARTMENT_MANAGER",
-                  decision: "PENDING",
-                  createdAt: now,
-                  slaHours: 48,
-                  slaExpiresAt: new Date(Date.now() + 48 * 3600 * 1000).toISOString(),
-                  isEscalated: false,
-                },
-              ]
-            : [],
-          comments: [],
-          watchers: [get().currentUserId],
-          createdAt: now,
-          updatedAt: now,
-          submittedAt: data.submit ? now : undefined,
-          version: 1,
-        };
-        set((s) => ({ requests: [newRequest, ...s.requests] }));
-        logEvent(get, set, {
-          eventType: data.submit ? "REQUEST_SUBMITTED" : "REQUEST_CREATED",
-          description: `${user.name} ${data.submit ? "submitted" : "created draft"} ${newRequest.requestNumber}: '${newRequest.title}'`,
-          severity: "INFO",
-          requestId: id,
+          neededByDate: new Date(data.neededByDate).toISOString(),
+          lineItems: data.lineItems.map((li) => ({
+            itemName: li.itemName,
+            description: li.description ?? "",
+            quantity: li.quantity,
+            unit: li.unit,
+            estimatedCost: li.estimatedCost,
+            taxRate: li.taxRate ?? 0,
+          })),
+          templateId: data.templateId,
+          submit: data.submit,
         });
-        if (data.templateId) {
-          set((s) => ({
-            templates: s.templates.map((t) =>
-              t.id === data.templateId ? { ...t, usageCount: t.usageCount + 1 } : t
-            ),
-          }));
-        }
-        return id;
+        await get().refresh();
+        return created.id;
       },
 
-      submitRequest: (requestId) => {
-        const now = new Date().toISOString();
-        set((s) => ({
-          requests: s.requests.map((r) =>
-            r.id === requestId
-              ? {
-                  ...r,
-                  status: "SUBMITTED",
-                  submittedAt: now,
-                  updatedAt: now,
-                  approvals:
-                    r.approvals.length === 0
-                      ? [
-                          {
-                            id: generateId("ap"),
-                            requestId,
-                            stage: "DEPARTMENT_MANAGER",
-                            approverId: s.users.find((u) => u.role === "DEPARTMENT_MANAGER")?.id ?? "usr_chidi",
-                            approverRole: "DEPARTMENT_MANAGER",
-                            decision: "PENDING",
-                            createdAt: now,
-                            slaHours: 48,
-                            slaExpiresAt: new Date(Date.now() + 48 * 3600 * 1000).toISOString(),
-                            isEscalated: false,
-                          },
-                        ]
-                      : r.approvals,
-                }
-              : r
-          ),
-        }));
-        const req = get().requests.find((r) => r.id === requestId);
-        const user = get().users.find((u) => u.id === get().currentUserId);
-        if (req) {
-          logEvent(get, set, {
-            eventType: "REQUEST_SUBMITTED",
-            description: `${user?.name} submitted ${req.requestNumber}: '${req.title}'`,
-            requestId,
-          });
-        }
+      submitRequest: async (requestId) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/requests/${requestId}/submit`);
+        await get().refresh();
       },
 
-      approveRequest: (requestId, decision, comment) => {
-        const now = new Date().toISOString();
+      approveRequest: async (requestId, decision, comment) => {
+        const { api } = await import("./api/client");
         const state = get();
-        const req = state.requests.find((r) => r.id === requestId);
-        if (!req) return;
+        const request = state.requests.find((r) => r.id === requestId);
+        if (!request) throw new Error("Request not found");
 
-        const pendingIdx = req.approvals.findIndex((a) => a.decision === "PENDING");
-        if (pendingIdx === -1) return;
-        const currentStage = req.approvals[pendingIdx].stage;
-        const updatedApprovals = [...req.approvals];
-        updatedApprovals[pendingIdx] = {
-          ...updatedApprovals[pendingIdx],
+        // The server decides on a specific approval *step*, not on the request as
+        // a whole, so that it can verify the caller is that step's assigned
+        // approver. Resolve the step this user is actually able to act on.
+        const pending = request.approvals.filter((a) => a.decision === "PENDING");
+        const lowestSequence = pending.reduce(
+          (min, a) => Math.min(min, a.sequence ?? 0),
+          Number.POSITIVE_INFINITY
+        );
+        const active = pending.filter((a) => (a.sequence ?? 0) === lowestSequence);
+        const mine =
+          active.find(
+            (a) => a.approverId === state.currentUserId || a.delegatedTo === state.currentUserId
+          ) ?? active[0];
+
+        if (!mine) throw new Error("There is no approval step awaiting a decision on this request");
+
+        await api.post(`/api/requests/${requestId}/decide`, {
+          stepId: mine.id,
           decision,
-          comment: comment || undefined,
-          decidedAt: now,
-        };
-
-        let newStatus = req.status;
-        let nextApproval: PurchaseRequest["approvals"][number] | null = null;
-
-        if (decision === "REJECTED") {
-          newStatus = "REJECTED";
-        } else if (decision === "CHANGES_REQUESTED") {
-          newStatus = "UNDER_REVIEW";
-        } else if (decision === "APPROVED") {
-          const stages: ApprovalStage[] = ["DEPARTMENT_MANAGER", "FINANCE", "PROCUREMENT", "EXECUTIVE"];
-          const stageIdx = stages.indexOf(currentStage);
-          const applicableWorkflow = state.workflows.find(
-            (w) => w.isActive && (!w.thresholdMax || req.totalEstimated <= w.thresholdMax)
-          );
-          const remainingStages = stages.slice(stageIdx + 1);
-          const nextStage = remainingStages[0];
-
-          if (nextStage) {
-            newStatus = "UNDER_REVIEW";
-            const nextApprover = state.users.find((u) => {
-              if (nextStage === "FINANCE") return u.role === "FINANCE_OFFICER";
-              if (nextStage === "PROCUREMENT") return u.role === "PROCUREMENT_MANAGER";
-              if (nextStage === "EXECUTIVE") return u.role === "SUPER_ADMIN";
-              if (nextStage === "DEPARTMENT_MANAGER") return u.role === "DEPARTMENT_MANAGER";
-              return false;
-            });
-            if (nextApprover) {
-              const slaHours = applicableWorkflow?.stages.find((s) => s.stage === nextStage)?.slaHours ?? 48;
-              nextApproval = {
-                id: generateId("ap"),
-                requestId,
-                stage: nextStage,
-                approverId: nextApprover.id,
-                approverRole: nextApprover.role,
-                decision: "PENDING",
-                createdAt: now,
-                slaHours,
-                slaExpiresAt: new Date(Date.now() + slaHours * 3600 * 1000).toISOString(),
-                isEscalated: false,
-              };
-            }
-          } else {
-            newStatus = "APPROVED";
-          }
-        }
-
-        const finalApprovals = nextApproval ? [...updatedApprovals, nextApproval] : updatedApprovals;
-        set((s) => ({
-          requests: s.requests.map((r) =>
-            r.id === requestId ? { ...r, approvals: finalApprovals, status: newStatus, updatedAt: now } : r
-          ),
-        }));
-
-        const user = state.users.find((u) => u.id === state.currentUserId);
-        const decisionText = decision === "APPROVED" ? "approved" : decision === "REJECTED" ? "rejected" : "requested changes on";
-        logEvent(get, set, {
-          eventType: decision === "APPROVED" ? "REQUEST_APPROVED" : decision === "REJECTED" ? "REQUEST_REJECTED" : "STATUS_CHANGE",
-          description: `${user?.name} ${decisionText} ${req.requestNumber} at the ${currentStage.replace("_", " ").toLowerCase()} stage${comment ? ` — "${comment}"` : ""}`,
-          severity: decision === "REJECTED" ? "WARNING" : "SUCCESS",
-          requestId,
+          comment: comment ?? "",
         });
-
-        const notification: Notification = {
-          id: generateId("ntf"),
-          organizationId: state.organization.id,
-          userId: req.requestedById,
-          title: `${req.requestNumber} ${decisionText}`,
-          message: `${user?.name} ${decisionText} your request: "${req.title}"${comment ? ` — ${comment}` : ""}`,
-          type: decision === "APPROVED" ? "success" : decision === "REJECTED" ? "error" : "warning",
-          read: false,
-          link: "requests",
-          entityId: requestId,
-          entityType: "REQUEST",
-          createdAt: now,
-        };
-        set((s) => ({ notifications: [notification, ...s.notifications] }));
+        await get().refresh();
       },
 
-      cancelRequest: (requestId) => {
-        const now = new Date().toISOString();
-        set((s) => ({
-          requests: s.requests.map((r) =>
-            r.id === requestId ? { ...r, status: "CANCELLED", updatedAt: now } : r
-          ),
-        }));
-        const req = get().requests.find((r) => r.id === requestId);
-        if (req) {
-          logEvent(get, set, {
-            eventType: "REQUEST_CANCELLED",
-            description: `${get().users.find((u) => u.id === get().currentUserId)?.name} cancelled ${req.requestNumber}`,
-            severity: "WARNING",
-            requestId,
-          });
-        }
+      cancelRequest: async (requestId, reason) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/requests/${requestId}/cancel`, {
+          reason: reason?.trim() || "Cancelled by requester",
+        });
+        await get().refresh();
       },
 
       duplicateRequest: (requestId) => {
@@ -819,45 +768,16 @@ export const useStore = create<AppState>()(
         });
       },
 
-      addComment: (entityType, entityId, content, mentions = []) => {
-        const now = new Date().toISOString();
-        const comment: Comment = {
-          id: generateId("cm"),
-          entityType,
-          entityId,
-          authorId: get().currentUserId,
+      addComment: async (entityType, entityId, content, mentions) => {
+        const { api } = await import("./api/client");
+        if (entityType !== "REQUEST") {
+          throw new Error("Comments are currently supported on purchase requests only");
+        }
+        await api.post(`/api/requests/${entityId}/comments`, {
           content,
-          mentions,
-          createdAt: now,
-        };
-        set((s) => ({
-          requests: s.requests.map((r) =>
-            r.id === entityId ? { ...r, comments: [...r.comments, comment], updatedAt: now } : r
-          ),
-        }));
-        const user = get().users.find((u) => u.id === get().currentUserId);
-        logEvent(get, set, {
-          eventType: "COMMENT_ADDED",
-          description: `${user?.name} commented on ${entityType.toLowerCase()} ${entityId.slice(0, 8)}`,
-          severity: "INFO",
+          mentions: mentions ?? [],
         });
-        // Notify mentioned users
-        mentions.forEach((uid) => {
-          const notification: Notification = {
-            id: generateId("ntf"),
-            organizationId: get().organization.id,
-            userId: uid,
-            title: `You were mentioned`,
-            message: `${user?.name} mentioned you: "${content.slice(0, 80)}${content.length > 80 ? "…" : ""}"`,
-            type: "mention",
-            read: false,
-            link: "requests",
-            entityId,
-            entityType,
-            createdAt: now,
-          };
-          set((s) => ({ notifications: [notification, ...s.notifications] }));
-        });
+        await get().refresh();
       },
 
       addWatcher: (requestId, userId) => {
@@ -888,10 +808,10 @@ export const useStore = create<AppState>()(
           severity: "INFO",
         });
       },
-      useTemplate: (templateId) => {
+      useTemplate: async (templateId) => {
         const tpl = get().templates.find((t) => t.id === templateId);
         if (tpl) {
-          const id = get().createRequest({
+          const id = await get().createRequest({
             title: tpl.name,
             departmentId: tpl.departmentId ?? get().departments[0]?.id ?? "",
             priority: tpl.priority,
@@ -1004,31 +924,17 @@ export const useStore = create<AppState>()(
       },
 
       // RFQs
-      createRFQ: (data) => {
-        const seq = get().rfqs.length + 1;
-        const id = generateId("rfq");
-        const now = new Date().toISOString();
-        const newRFQ: RFQ = {
-          id,
-          organizationId: get().organization.id,
-          rfqNumber: generateRfqNumber(seq),
-          requestId: data.requestId,
+      createRFQ: async (data) => {
+        const { api } = await import("./api/client");
+        const created = await api.post<{ id: string }>("/api/rfqs", {
           title: data.title,
           description: data.description,
-          deadline: data.deadline,
-          status: "WAITING",
+          deadline: new Date(data.deadline).toISOString(),
+          requestId: data.requestId,
           invitedVendorIds: data.invitedVendorIds,
-          quotations: [],
-          remindersSent: 0,
-          createdAt: now,
-        };
-        set((s) => ({ rfqs: [newRFQ, ...s.rfqs] }));
-        logEvent(get, set, {
-          eventType: "RFQ_CREATED",
-          description: `${get().users.find((u) => u.id === get().currentUserId)?.name} created ${newRFQ.rfqNumber}: '${newRFQ.title}' — invited ${data.invitedVendorIds.length} vendor(s)`,
-          rfqId: id,
         });
-        return id;
+        await get().refresh();
+        return created.id;
       },
 
       cancelRFQ: (rfqId) => {
@@ -1077,105 +983,37 @@ export const useStore = create<AppState>()(
       },
 
       // Quotations
-      selectQuotation: (rfqId, quotationId) => {
-        const now = new Date().toISOString();
-        set((s) => ({
-          rfqs: s.rfqs.map((r) =>
-            r.id === rfqId ? { ...r, selectedQuotationId: quotationId, status: "CLOSED" } : r
-          ),
-        }));
-        const rfq = get().rfqs.find((r) => r.id === rfqId);
-        const quote = rfq?.quotations.find((q) => q.id === quotationId);
-        const vendor = get().vendors.find((v) => v.id === quote?.vendorId);
-        if (rfq && vendor && quote) {
-          logEvent(get, set, {
-            eventType: "QUOTATION_SELECTED",
-            description: `${get().users.find((u) => u.id === get().currentUserId)?.name} selected ${vendor.companyName}'s quotation ($${quote.totalAmount.toLocaleString()}) for ${rfq.rfqNumber}`,
-            severity: "SUCCESS",
-            rfqId,
-            vendorId: vendor.id,
-          });
-        }
+      selectQuotation: async (rfqId, quotationId) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/rfqs/${rfqId}/award`, { quotationId, justification: "" });
+        await get().refresh();
       },
 
       // POs
-      generatePO: (data) => {
-        const seq = get().purchaseOrders.length + 1;
-        const id = generateId("po");
-        const now = new Date().toISOString();
-        const subtotal = data.lineItems.reduce((s, li) => s + li.quantity * li.estimatedCost, 0);
-        const taxRate = data.taxRate ?? 7.5;
-        const taxAmount = subtotal * (taxRate / 100);
-        const total = subtotal + taxAmount;
-        const vendor = get().vendors.find((v) => v.id === data.vendorId);
-        const currency = data.currency ?? "NGN";
-        const newPO: PurchaseOrder = {
-          id,
-          organizationId: get().organization.id,
-          poNumber: generatePoNumber(seq),
+      generatePO: async (data) => {
+        const { api } = await import("./api/client");
+        const created = await api.post<{ id: string }>("/api/purchase-orders", {
+          vendorId: data.vendorId,
           requestId: data.requestId,
           rfqId: data.rfqId,
           quotationId: data.quotationId,
-          vendorId: data.vendorId,
-          status: "ISSUED",
-          subtotal,
-          taxAmount,
-          totalAmount: total,
-          currency,
-          taxRate,
-          issuedAt: now,
-          expectedDelivery: data.expectedDelivery,
-          notes: data.notes,
-          termsAndConditions: "1. Payment terms per vendor agreement.\n2. Goods must meet specifications.\n3. Discrepancies reported within 48 hours.\n4. Subject to organization's standard procurement policies.",
-          lineItems: data.lineItems,
-          version: 1,
-          revisions: [{ version: 1, modifiedAt: now, modifiedBy: get().currentUserId, reason: "Initial issue" }],
-          attachments: [],
-        };
-        set((s) => ({ purchaseOrders: [newPO, ...s.purchaseOrders] }));
-        // Auto-update vendor stats
-        if (vendor) {
-          set((s) => ({
-            vendors: s.vendors.map((v) =>
-              v.id === vendor.id
-                ? { ...v, totalOrders: v.totalOrders + 1, totalValue: v.totalValue + subtotal, status: v.status === "PROSPECTIVE" ? "ACTIVE" : v.status }
-                : v
-            ),
-          }));
-        }
-        // Auto-update budget committed amount
-        if (data.requestId) {
-          const req = get().requests.find((r) => r.id === data.requestId);
-          if (req?.departmentId) {
-            set((s) => ({
-              budgets: s.budgets.map((b) => {
-                if (b.departmentId !== req.departmentId) return b;
-                const newCommitted = b.committedAmount + subtotal;
-                return {
-                  ...b,
-                  committedAmount: newCommitted,
-                  remainingAmount: b.totalAmount - b.spentAmount - newCommitted,
-                };
-              }),
-            }));
-          }
-        }
-        // Auto-update request status to COMPLETED
-        if (data.requestId) {
-          set((s) => ({
-            requests: s.requests.map((r) =>
-              r.id === data.requestId ? { ...r, status: "COMPLETED" as const, completedAt: now, updatedAt: now } : r
-            ),
-          }));
-        }
-        logEvent(get, set, {
-          eventType: "PO_GENERATED",
-          description: `${get().users.find((u) => u.id === get().currentUserId)?.name} generated Purchase Order ${newPO.poNumber} to ${vendor?.companyName ?? "vendor"} ($${subtotal.toLocaleString()})`,
-          severity: "SUCCESS",
-          purchaseOrderId: id,
-          vendorId: data.vendorId,
+          expectedDelivery: new Date(data.expectedDelivery).toISOString(),
+          taxRate: data.taxRate ?? 0,
+          discountAmount: 0,
+          notes: data.notes ?? "",
+          lineItems: data.lineItems.map((li) => ({
+            itemName: li.itemName,
+            description: li.description ?? "",
+            quantity: li.quantity,
+            unit: li.unit,
+            unitPrice: li.estimatedCost,
+            taxRate: li.taxRate ?? 0,
+            createsAsset: false,
+          })),
+          issue: true,
         });
-        return id;
+        await get().refresh();
+        return created.id;
       },
 
       updatePOStatus: (poId, status) => {
@@ -1381,107 +1219,27 @@ export const useStore = create<AppState>()(
       },
 
       // Goods Receipts
-      createGoodsReceipt: (data) => {
-        const seq = get().goodsReceipts.length + 1;
-        const id = generateId("gr");
-        const now = new Date().toISOString();
-        const po = get().purchaseOrders.find((p) => p.id === data.poId);
-        const allReceived = data.items.every((i) => i.receivedQty >= i.orderedQty);
-        const anyReceived = data.items.some((i) => i.receivedQty > 0);
-        const status: GoodsReceiptStatus = allReceived ? "RECEIVED" : anyReceived ? "PARTIAL" : "PENDING";
-        const newReceipt: GoodsReceipt = {
-          id,
-          organizationId: get().organization.id,
-          receiptNumber: `GR-2026-${String(seq).padStart(4, "0")}`,
-          poId: data.poId,
-          vendorId: data.vendorId,
-          receivedById: get().currentUserId,
-          status,
-          receivedDate: now,
-          notes: data.notes,
-          items: data.items.map((i) => ({ ...i, id: generateId("gri") })),
-          attachments: [],
-          createdAt: now,
-        };
-        set((s) => ({ goodsReceipts: [newReceipt, ...s.goodsReceipts] }));
-        // Update PO status if fully received
-        if (allReceived && po) {
-          get().updatePOStatus(po.id, "RECEIVED");
-        }
-        logEvent(get, set, {
-          eventType: "PO_STATUS_UPDATED",
-          description: `Goods receipt ${newReceipt.receiptNumber} created for PO ${po?.poNumber} — ${status.toLowerCase()}`,
-          severity: "SUCCESS",
+      createGoodsReceipt: async (data) => {
+        const { api } = await import("./api/client");
+        const created = await api.post<{ id: string }>("/api/goods-receipts", {
           purchaseOrderId: data.poId,
-          vendorId: data.vendorId,
+          notes: data.notes,
+          items: data.items
+            .filter((i) => i.receivedQty > 0 || i.condition !== "GOOD")
+            .map((i) => ({
+              poLineItemId: i.lineItemId,
+              receivedQty: i.receivedQty,
+              // A line marked MISSING accounts for the shortfall as rejected, so
+              // the PO does not sit forever waiting on goods that never arrived.
+              rejectedQty:
+                i.condition === "MISSING" ? Math.max(0, i.orderedQty - i.receivedQty) : 0,
+              condition: i.condition,
+              notes: i.notes,
+            })),
+          post: true,
         });
-        // Auto-convert budget committed → spent when goods received
-        if (allReceived && po) {
-          const subtotal = po.subtotal;
-          if (po.requestId) {
-            const req = get().requests.find((r) => r.id === po.requestId);
-            if (req?.departmentId) {
-              set((s) => ({
-                budgets: s.budgets.map((b) => {
-                  if (b.departmentId !== req.departmentId) return b;
-                  const newCommitted = Math.max(0, b.committedAmount - subtotal);
-                  const newSpent = b.spentAmount + subtotal;
-                  return {
-                    ...b,
-                    committedAmount: newCommitted,
-                    spentAmount: newSpent,
-                    remainingAmount: b.totalAmount - newSpent - newCommitted,
-                    alerts: b.alerts.map((a) => {
-                      const pct = (newSpent / b.totalAmount) * 100;
-                      if (!a.triggered && pct >= a.threshold) {
-                        return { ...a, triggered: true, triggeredAt: now };
-                      }
-                      return a;
-                    }),
-                  };
-                }),
-              }));
-            }
-          }
-          // Auto-update vendor performance
-          set((s) => ({
-            vendors: s.vendors.map((v) =>
-              v.id === data.vendorId
-                ? { ...v, onTimeDeliveryRate: Math.min(100, v.onTimeDeliveryRate + 1), totalOrders: v.totalOrders }
-                : v
-            ),
-          }));
-        }
-        // Auto-create assets for equipment POs
-        if (allReceived && po) {
-          po.lineItems.forEach((li) => {
-            if (li.estimatedCost > 1000) {
-              const assetId = generateId("ast");
-              const seq2 = get().assets.length + 1;
-              const newAsset: Asset = {
-                id: assetId,
-                organizationId: get().organization.id,
-                assetTag: `AST-${String(seq2).padStart(5, "0")}`,
-                name: li.itemName,
-                category: "IT_EQUIPMENT",
-                poId: po.id,
-                vendorId: data.vendorId,
-                status: "IN_STORAGE",
-                purchaseDate: now,
-                purchaseValue: li.estimatedCost,
-                currentValue: li.estimatedCost,
-                currency: po.currency,
-                depreciationRate: 20,
-                notes: `Auto-created from goods receipt ${newReceipt.receiptNumber}`,
-                maintenanceHistory: [],
-                transfers: [],
-                createdAt: now,
-              };
-              set((s) => ({ assets: [newAsset, ...s.assets] }));
-            }
-          });
-        }
-        return id;
+        await get().refresh();
+        return created.id;
       },
       updateGoodsReceiptStatus: (id, status) => {
         set((s) => ({
@@ -1491,53 +1249,30 @@ export const useStore = create<AppState>()(
       },
 
       // Invoices
-      createInvoice: (data) => {
-        const seq = get().invoices.length + 1;
-        const id = generateId("inv");
-        const now = new Date().toISOString();
-        const total = data.subtotal + data.taxAmount;
-        const newInvoice: Invoice = {
-          id,
-          organizationId: get().organization.id,
-          invoiceNumber: `INV-2026-${String(seq).padStart(4, "0")}`,
+      createInvoice: async (data) => {
+        const { api } = await import("./api/client");
+        const created = await api.post<{ id: string }>("/api/invoices", {
           vendorId: data.vendorId,
-          poId: data.poId,
-          status: "SUBMITTED",
-          issueDate: data.issueDate,
-          dueDate: data.dueDate,
-          subtotal: data.subtotal,
-          taxAmount: data.taxAmount,
-          totalAmount: total,
-          currency: "NGN",
-          paidAmount: 0,
-          balance: total,
+          purchaseOrderId: data.poId,
+          issueDate: new Date(data.issueDate).toISOString(),
+          dueDate: new Date(data.dueDate).toISOString(),
           notes: data.notes,
-          attachments: [],
-          createdAt: now,
-        };
-        set((s) => ({ invoices: [newInvoice, ...s.invoices] }));
-        logEvent(get, set, {
-          eventType: "FILE_UPLOADED",
-          description: `Invoice ${newInvoice.invoiceNumber} created for vendor — $${total}`,
-          severity: "INFO",
-          vendorId: data.vendorId,
+          submit: true,
         });
-        return id;
+        await get().refresh();
+        return created.id;
       },
-      approveInvoice: (id) => {
-        const now = new Date().toISOString();
-        set((s) => ({
-          invoices: s.invoices.map((inv) =>
-            inv.id === id ? { ...inv, status: "APPROVED", approvedById: get().currentUserId, approvedAt: now } : inv
-          ),
-        }));
-        logEvent(get, set, { eventType: "STATUS_CHANGE", description: `Invoice approved`, severity: "SUCCESS" });
+      approveInvoice: async (id) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/invoices/${id}/approve`, {});
+        await get().refresh();
       },
-      rejectInvoice: (id, reason) => {
-        set((s) => ({
-          invoices: s.invoices.map((inv) => (inv.id === id ? { ...inv, status: "REJECTED", notes: reason } : inv)),
-        }));
-        logEvent(get, set, { eventType: "STATUS_CHANGE", description: `Invoice rejected: ${reason}`, severity: "WARNING" });
+      rejectInvoice: async (id, reason) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/invoices/${id}/reject`, {
+          reason: reason?.trim() || "Rejected on review",
+        });
+        await get().refresh();
       },
       updateInvoiceStatus: (id, status) => {
         set((s) => ({
@@ -1547,48 +1282,18 @@ export const useStore = create<AppState>()(
       },
 
       // Payments
-      createPayment: (data) => {
-        const seq = get().payments.length + 1;
-        const id = generateId("pay");
-        const now = new Date().toISOString();
-        const newPayment: Payment = {
-          id,
-          organizationId: get().organization.id,
-          paymentNumber: `PAY-2026-${String(seq).padStart(4, "0")}`,
+      createPayment: async (data) => {
+        const { api } = await import("./api/client");
+        const created = await api.post<{ id: string }>("/api/payments", {
           invoiceId: data.invoiceId,
-          vendorId: data.vendorId,
           amount: data.amount,
-          currency: "NGN",
           method: data.method,
-          status: "COMPLETED",
-          paymentDate: data.paymentDate,
+          scheduledFor: data.paymentDate ? new Date(data.paymentDate).toISOString() : undefined,
           reference: data.reference,
           notes: data.notes,
-          processedById: get().currentUserId,
-          createdAt: now,
-        };
-        set((s) => ({ payments: [newPayment, ...s.payments] }));
-        // Update invoice paidAmount and status
-        set((s) => ({
-          invoices: s.invoices.map((inv) => {
-            if (inv.id !== data.invoiceId) return inv;
-            const paidAmount = inv.paidAmount + data.amount;
-            const balance = inv.totalAmount - paidAmount;
-            return {
-              ...inv,
-              paidAmount,
-              balance,
-              status: balance <= 0 ? "PAID" : inv.status,
-            };
-          }),
-        }));
-        logEvent(get, set, {
-          eventType: "PO_STATUS_UPDATED",
-          description: `Payment ${newPayment.paymentNumber} processed — $${data.amount} via ${data.method.replace("_", " ").toLowerCase()}`,
-          severity: "SUCCESS",
-          vendorId: data.vendorId,
         });
-        return id;
+        await get().refresh();
+        return created.id;
       },
       updatePaymentStatus: (id, status) => {
         set((s) => ({
