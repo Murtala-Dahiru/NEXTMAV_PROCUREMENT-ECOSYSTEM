@@ -15,6 +15,7 @@
 
 import { PrismaClient, Prisma } from "@prisma/client";
 import { hashPassword } from "../src/server/password.ts";
+import { ensureSystemRoles } from "../src/server/roles.ts";
 import * as seed from "../src/lib/seed-data.ts";
 
 const db = new PrismaClient({ log: ["error"] });
@@ -51,8 +52,10 @@ async function reset() {
   await db.rFQ.updateMany({ data: { selectedQuotationId: null } });
 
   const order = [
+    db.eventOutbox,
     db.aIMessage,
     db.aIConversation,
+    db.documentLink,
     db.documentAccessLog,
     db.documentVersion,
     db.documentRecord,
@@ -68,6 +71,9 @@ async function reset() {
     db.activityLog,
     db.budgetEntry,
     db.budgetAlert,
+    db.paymentAllocation,
+    db.paymentTransaction,
+    db.invoiceMatchException,
     db.budgetCategory,
     db.budget,
     db.payment,
@@ -77,6 +83,7 @@ async function reset() {
     db.assetTransfer,
     db.asset,
     db.stockMovement,
+    db.stockBalance,
     db.goodsReceiptItem,
     db.goodsReceipt,
     db.pORevision,
@@ -87,7 +94,10 @@ async function reset() {
     db.contractVersion,
     db.contract,
     db.quotationLineItem,
+    db.quotationScore,
+    db.rFQAward,
     db.quotation,
+    db.rFQEvaluationCriterion,
     db.rFQVendor,
     db.rFQLineItem,
     db.rFQ,
@@ -95,6 +105,8 @@ async function reset() {
     db.requestWatcher,
     db.requestVersion,
     db.approvalStep,
+    db.approvalInstance,
+    db.approvalDelegation,
     db.requestLineItem,
     db.purchaseRequest,
     db.recurringRequest,
@@ -105,12 +117,21 @@ async function reset() {
     db.supplierActivity,
     db.supplierUser,
     db.vendorDocument,
+    db.vendorContact,
+    db.vendorCategoryLink,
+    db.vendorRiskAssessment,
+    db.vendorPerformanceSnapshot,
     db.vendor,
-    db.rolePermissionOverride,
+    db.userRoleAssignment,
+    db.rolePermission,
+    db.role,
     db.session,
     db.user,
     db.storedFile,
+    db.warehouse,
+    db.procurementCategory,
     db.department,
+    db.costCenter,
     db.branch,
     db.documentSequence,
     db.rateLimitBucket,
@@ -120,6 +141,17 @@ async function reset() {
   for (const model of order) {
     await (model as { deleteMany: (a?: unknown) => Promise<unknown> }).deleteMany({});
   }
+}
+
+/**
+ * Maps a demo request status onto the lifecycle.
+ *
+ * Kept as a function rather than inlined: the demo dataset is edited by hand and
+ * a status it predates should fail here, loudly, rather than reach the database.
+ */
+function requestStatus(status: string): Prisma.PurchaseRequestCreateInput["status"] {
+  if (status === "COMPLETED") return "CLOSED";
+  return status as Prisma.PurchaseRequestCreateInput["status"];
 }
 
 async function main() {
@@ -159,15 +191,72 @@ async function main() {
     })),
   });
 
+  // One cost centre per department, which is how a mid-sized organization
+  // usually starts: finance coding follows the org chart until it needs not to.
+  const costCenters = seed.seedDepartments.map((d, i) => ({
+    id: `cc-${d.id}`,
+    organizationId: org.id,
+    code: `CC-${String(i + 1).padStart(3, "0")}`,
+    name: `${d.name} Cost Centre`,
+  }));
+  await db.costCenter.createMany({ data: costCenters });
+
   await db.department.createMany({
     data: seed.seedDepartments.map((d) => ({
       id: d.id,
       organizationId: org.id,
       branchId: d.branchId ?? null,
+      costCenterId: `cc-${d.id}`,
       name: d.name,
+      code: d.name.slice(0, 3).toUpperCase(),
     })),
   });
-  console.log(`  branches ${seed.seedBranches.length} · departments ${seed.seedDepartments.length}`);
+
+  // A stocking location per branch, so received goods land somewhere real.
+  await db.warehouse.createMany({
+    data: seed.seedBranches.map((b, i) => ({
+      id: `wh-${b.id}`,
+      organizationId: org.id,
+      branchId: b.id,
+      code: `WH-${String(i + 1).padStart(2, "0")}`,
+      name: `${b.name} Store`,
+      address: b.address ?? null,
+      isDefault: i === 0,
+    })),
+  });
+
+  // Spend taxonomy, taken from the categories the demo data actually uses.
+  const categoryNames = [
+    ...new Set(
+      [
+        ...seed.seedRequests.map((r) => r.category),
+        ...seed.seedVendors.map((v) => v.category),
+      ].filter((c): c is string => Boolean(c))
+    ),
+  ];
+  await db.procurementCategory.createMany({
+    data: categoryNames.map((name, i) => ({
+      id: `cat-${i + 1}`,
+      organizationId: org.id,
+      code: name.replace(/[^A-Za-z0-9]+/g, "_").toUpperCase().slice(0, 30),
+      name,
+    })),
+  });
+  const categoryIdByName = new Map(categoryNames.map((n, i) => [n, `cat-${i + 1}`]));
+
+  // The role catalog, installed as data. Every permission check the platform
+  // makes resolves through these rows.
+  // The seed holds its own unextended client; the role installer is typed
+  // against the application's extended one. Same database, same delegates.
+  const roles = await ensureSystemRoles(
+    org.id,
+    db as unknown as Parameters<typeof ensureSystemRoles>[1]
+  );
+  const roleIdByKey = new Map(roles.map((r) => [r.key, r.id]));
+
+  console.log(
+    `  branches ${seed.seedBranches.length} · departments ${seed.seedDepartments.length} · cost centres ${costCenters.length} · roles ${roles.length}`
+  );
 
   // -------------------------------------------------------------------------
   // Users
@@ -219,7 +308,27 @@ async function main() {
       quietHoursEnd: pref.quietHoursEnd ?? null,
     },
   });
-  console.log(`  users ${seed.seedUsers.length}`);
+  // Grant each seeded user the role matching the legacy enum they carry, so
+  // authorization resolves through role assignments from the first login.
+  for (const u of seed.seedUsers) {
+    const role = roles.find((r) => r.legacyRole === u.role);
+    if (!role) continue;
+    await db.userRoleAssignment.create({
+      data: { organizationId: org.id, userId: u.id, roleId: role.id },
+    });
+  }
+
+  // A second role on the receiving officer, showing that roles compose: the same
+  // person records deliveries and manages the asset register.
+  const warehouseUser = seed.seedUsers.find((u) => u.role === "EMPLOYEE");
+  const warehouseRoleId = roleIdByKey.get("WAREHOUSE_OFFICER");
+  if (warehouseUser && warehouseRoleId) {
+    await db.userRoleAssignment.create({
+      data: { organizationId: org.id, userId: warehouseUser.id, roleId: warehouseRoleId },
+    });
+  }
+
+  console.log(`  users ${seed.seedUsers.length} · role grants ${seed.seedUsers.length + (warehouseUser ? 1 : 0)}`);
 
   // -------------------------------------------------------------------------
   // Vendors + compliance documents
@@ -318,10 +427,10 @@ async function main() {
         totalAmount: b.totalAmount,
         currency: org.currency,
         status: b.status,
-        committedAmount: b.committedAmount ?? 0,
-        spentAmount: b.spentAmount ?? 0,
-        reservedAmount: 0,
-        remainingAmount: b.remainingAmount ?? b.totalAmount,
+        // Rollups are not written here. They are recomputed below from the
+        // opening ledger entries, so that even the demo data satisfies the
+        // invariant the platform depends on: every figure on a budget is
+        // reconstructable from BudgetEntry, never merely asserted.
         createdAt: dateOr(b.createdAt),
         categories: {
           create: (b.categories ?? []).map((c) => ({
@@ -340,6 +449,54 @@ async function main() {
       },
     });
   }
+  // Opening balances. A budget that shows 89,600 spent with nothing in its
+  // ledger is exactly the "asserted, not reconstructable" state this schema
+  // exists to prevent, so the demo figures are given the entries that justify
+  // them and the rollups are then derived.
+  for (const b of seed.seedBudgets) {
+    const committed = b.committedAmount ?? 0;
+    const spent = b.spentAmount ?? 0;
+
+    if (committed > 0) {
+      await db.budgetEntry.create({
+        data: {
+          budgetId: b.id,
+          type: "COMMITTED",
+          amount: committed,
+          currency: org.currency,
+          description: "Opening balance — orders placed before this system",
+          createdAt: dateOr(b.createdAt),
+        },
+      });
+    }
+    if (spent > 0) {
+      await db.budgetEntry.create({
+        data: {
+          budgetId: b.id,
+          type: "SPENT",
+          amount: spent,
+          currency: org.currency,
+          description: "Opening balance — spend recognised before this system",
+          createdAt: dateOr(b.createdAt),
+        },
+      });
+    }
+
+    const remaining = b.totalAmount - spent - committed;
+    await db.budget.update({
+      where: { id: b.id },
+      data: {
+        committedAmount: committed,
+        spentAmount: spent,
+        invoicedAmount: spent,
+        reservedAmount: 0,
+        requestedAmount: 0,
+        paidAmount: 0,
+        remainingAmount: remaining,
+      },
+    });
+  }
+
   console.log(`  budgets ${seed.seedBudgets.length}`);
 
   // -------------------------------------------------------------------------
@@ -373,8 +530,12 @@ async function main() {
         requestNumber: r.requestNumber,
         title: r.title,
         departmentId: r.departmentId ?? null,
+        costCenterId: r.departmentId ? `cc-${r.departmentId}` : null,
+        categoryId: r.category ? (categoryIdByName.get(r.category) ?? null) : null,
         requestedById: r.requestedById,
-        status: r.status,
+        // The demo dataset predates the fuller lifecycle: what it calls COMPLETED
+        // is a request whose chain has settled, which is now CLOSED.
+        status: requestStatus(r.status),
         priority: r.priority,
         category: r.category ?? null,
         tags: json(r.tags),
@@ -384,7 +545,8 @@ async function main() {
         currency: r.currency ?? org.currency,
         version: r.version ?? 1,
         submittedAt: date(r.submittedAt),
-        completedAt: date(r.completedAt),
+        approvedAt: r.status === "APPROVED" || r.status === "CLOSED" ? date(r.submittedAt) : null,
+        closedAt: date(r.completedAt),
         createdAt: dateOr(r.createdAt),
         updatedAt: dateOr(r.updatedAt),
         lineItems: {
@@ -463,6 +625,7 @@ async function main() {
         quotations: {
           create: (rfq.quotations ?? []).map((q) => ({
             id: q.id,
+            organizationId: org.id,
             vendorId: q.vendorId,
             revision: 1,
             totalAmount: q.totalAmount,
@@ -963,8 +1126,9 @@ async function main() {
       action: a.action,
       resource: a.resource,
       resourceId: a.resourceId ?? null,
-      before: json(a.before),
-      after: json(a.after),
+      // jsonb columns: hand Prisma the object, not a string of one.
+      before: (a.before ?? undefined) as Prisma.InputJsonValue | undefined,
+      after: (a.after ?? undefined) as Prisma.InputJsonValue | undefined,
       ipAddress: a.ipAddress ?? null,
       userAgent: a.userAgent ?? null,
       createdAt: dateOr(a.timestamp),

@@ -11,8 +11,8 @@
 //   QUANTITY_VARIANCE invoiced quantity exceeds what was received
 //   MATCHED           PO ↔ receipt ↔ invoice agree within tolerance
 
-import type { InvoiceStatus, MatchStatus, Prisma } from "@prisma/client";
-import { db } from "../db";
+import type { InvoiceStatus, MatchExceptionType, MatchStatus, Prisma } from "@prisma/client";
+import { db, type Tx } from "../db";
 import { conflict, notFound, validation } from "../errors";
 import { assertPermission } from "../permissions";
 import { recordActivity, recordAudit } from "../audit";
@@ -20,6 +20,7 @@ import { nextDocumentNumber, PREFIX } from "../numbering";
 import { emit } from "../engines/events";
 import * as budgetEngine from "../engines/budget";
 import * as requestService from "./request-service";
+import { transition } from "../state-machine";
 import { orderBy, paginate, scoped, type Page, type ServiceContext } from "./context";
 import type { createInvoiceSchema, listQuerySchema } from "@/lib/schemas/procurement";
 import type { z } from "zod";
@@ -52,7 +53,7 @@ const invoiceInclude = {
 // ---------------------------------------------------------------------------
 
 export async function list(ctx: ServiceContext, q: ListInput): Promise<Page<unknown>> {
-  await assertPermission(ctx.principal, "purchaseOrders.view");
+  await assertPermission(ctx.principal, "invoices.view");
   const tdb = scoped(ctx);
 
   const where: Prisma.InvoiceWhereInput = {};
@@ -90,7 +91,7 @@ export async function list(ctx: ServiceContext, q: ListInput): Promise<Page<unkn
 }
 
 export async function getById(ctx: ServiceContext, id: string) {
-  await assertPermission(ctx.principal, "purchaseOrders.view");
+  await assertPermission(ctx.principal, "invoices.view");
   const invoice = await scoped(ctx).invoice.findUnique({ where: { id }, include: invoiceInclude });
   if (!invoice) throw notFound("Invoice not found");
   const match = await evaluateMatch(ctx.principal.organizationId, id);
@@ -106,7 +107,27 @@ export interface MatchResult {
   type: "NONE" | "TWO_WAY" | "THREE_WAY";
   variance: number;
   issues: { line: string; kind: string; detail: string }[];
+  /**
+   * The same findings in a form that can be stored, assigned and resolved.
+   * `issues` is what a person reads; these are what the platform keeps.
+   */
+  exceptions: MatchException[];
   canApprove: boolean;
+}
+
+export interface MatchException {
+  type: MatchExceptionType;
+  invoiceLineId: string | null;
+  poLineItemId: string | null;
+  orderedQty: number | null;
+  receivedQty: number | null;
+  invoicedQty: number | null;
+  orderedPrice: number | null;
+  invoicedPrice: number | null;
+  variance: number | null;
+  variancePct: number | null;
+  tolerancePct: number | null;
+  detail: string;
 }
 
 /**
@@ -130,6 +151,7 @@ export async function evaluateMatch(
   if (!invoice) throw notFound("Invoice not found");
 
   const issues: MatchResult["issues"] = [];
+  const exceptions: MatchException[] = [];
 
   if (!invoice.purchaseOrder) {
     return {
@@ -141,6 +163,22 @@ export async function evaluateMatch(
           line: "—",
           kind: "NO_PO",
           detail: "This invoice is not linked to a purchase order, so it cannot be matched.",
+        },
+      ],
+      exceptions: [
+        {
+          type: "NO_PO_LINE",
+          invoiceLineId: null,
+          poLineItemId: null,
+          orderedQty: null,
+          receivedQty: null,
+          invoicedQty: null,
+          orderedPrice: null,
+          invoicedPrice: null,
+          variance: null,
+          variancePct: null,
+          tolerancePct: null,
+          detail: "Invoice is not linked to a purchase order.",
         },
       ],
       canApprove: true,
@@ -180,8 +218,23 @@ export async function evaluateMatch(
         kind: "UNMATCHED_LINE",
         detail: `"${invLine.itemName}" does not appear on ${po.poNumber}.`,
       });
-      variance += invLine.quantity * invLine.unitPrice;
+      const lineValue = invLine.quantity * invLine.unitPrice;
+      variance += lineValue;
       quantityVariance = true;
+      exceptions.push({
+        type: "NO_PO_LINE",
+        invoiceLineId: invLine.id,
+        poLineItemId: null,
+        orderedQty: null,
+        receivedQty: null,
+        invoicedQty: invLine.quantity,
+        orderedPrice: null,
+        invoicedPrice: invLine.unitPrice,
+        variance: lineValue,
+        variancePct: null,
+        tolerancePct: null,
+        detail: `"${invLine.itemName}" does not appear on ${po.poNumber}.`,
+      });
       continue;
     }
 
@@ -195,6 +248,20 @@ export async function evaluateMatch(
         line: invLine.itemName,
         kind: "PRICE_VARIANCE",
         detail: `Invoiced at ${invLine.unitPrice.toFixed(2)} per ${invLine.unit} against an ordered price of ${poLine.unitPrice.toFixed(2)} (${pctDelta.toFixed(1)}% difference).`,
+      });
+      exceptions.push({
+        type: "PRICE_VARIANCE",
+        invoiceLineId: invLine.id,
+        poLineItemId: poLine.id,
+        orderedQty: poLine.orderedQty,
+        receivedQty: receivedByLine.get(poLine.id) ?? 0,
+        invoicedQty: invLine.quantity,
+        orderedPrice: poLine.unitPrice,
+        invoicedPrice: invLine.unitPrice,
+        variance: priceDelta * invLine.quantity,
+        variancePct: pctDelta,
+        tolerancePct: PRICE_TOLERANCE_PCT,
+        detail: `Invoiced at ${invLine.unitPrice.toFixed(2)} against an ordered ${poLine.unitPrice.toFixed(2)}.`,
       });
     }
 
@@ -215,6 +282,25 @@ export async function evaluateMatch(
           ? `Invoiced ${invLine.quantity} ${invLine.unit} but only ${Math.max(0, available)} have been received and not yet invoiced.`
           : `Invoiced ${invLine.quantity} ${invLine.unit} but only ${Math.max(0, available)} remain uninvoiced on the order. No goods receipt exists, so this is a 2-way match only.`,
       });
+      exceptions.push({
+        // Billed for more than was received is a different problem from billed for
+        // goods that never arrived at all, and the two are chased differently.
+        type: hasReceipts && (receivedByLine.get(poLine.id) ?? 0) === 0 ? "NOT_RECEIVED" : "OVER_INVOICED",
+        invoiceLineId: invLine.id,
+        poLineItemId: poLine.id,
+        orderedQty: poLine.orderedQty,
+        receivedQty: receivedByLine.get(poLine.id) ?? 0,
+        invoicedQty: invLine.quantity,
+        orderedPrice: poLine.unitPrice,
+        invoicedPrice: invLine.unitPrice,
+        variance: (invLine.quantity - Math.max(0, available)) * invLine.unitPrice,
+        variancePct:
+          available > 0 ? ((invLine.quantity - available) / available) * 100 : null,
+        tolerancePct: 0,
+        detail: hasReceipts
+          ? `Invoiced ${invLine.quantity}, receivable ${Math.max(0, available)}.`
+          : `Invoiced ${invLine.quantity} with no goods receipt posted.`,
+      });
     }
   }
 
@@ -223,6 +309,42 @@ export async function evaluateMatch(
       line: "—",
       kind: "NO_RECEIPT",
       detail: `No goods receipt has been posted against ${po.poNumber}. Only a 2-way (PO ↔ invoice) match is possible.`,
+    });
+    exceptions.push({
+      type: "NOT_RECEIVED",
+      invoiceLineId: null,
+      poLineItemId: null,
+      orderedQty: null,
+      receivedQty: 0,
+      invoicedQty: null,
+      orderedPrice: null,
+      invoicedPrice: null,
+      variance: null,
+      variancePct: null,
+      tolerancePct: null,
+      detail: `No goods receipt posted against ${po.poNumber}; 2-way match only.`,
+    });
+  }
+
+  if (invoice.currency !== po.currency) {
+    exceptions.push({
+      type: "CURRENCY_MISMATCH",
+      invoiceLineId: null,
+      poLineItemId: null,
+      orderedQty: null,
+      receivedQty: null,
+      invoicedQty: null,
+      orderedPrice: null,
+      invoicedPrice: null,
+      variance: null,
+      variancePct: null,
+      tolerancePct: null,
+      detail: `Invoice is in ${invoice.currency} but ${po.poNumber} was raised in ${po.currency}.`,
+    });
+    issues.push({
+      line: "—",
+      kind: "CURRENCY_MISMATCH",
+      detail: `Invoice currency ${invoice.currency} does not match the order currency ${po.currency}.`,
     });
   }
 
@@ -234,7 +356,57 @@ export async function evaluateMatch(
         ? "MATCHED"
         : "NO_RECEIPT";
 
-  return { status, type, variance, issues, canApprove: true };
+  return { status, type, variance, issues, exceptions, canApprove: true };
+}
+
+/**
+ * Writes the match findings down.
+ *
+ * Exceptions are replaced rather than appended on each run, except for any an
+ * operator has already accepted or resolved — those are decisions about this
+ * invoice and re-running the match must not quietly erase them.
+ */
+export async function persistMatch(
+  tx: Tx,
+  organizationId: string,
+  invoiceId: string,
+  match: MatchResult
+): Promise<void> {
+  await tx.invoiceMatchException.deleteMany({
+    where: { invoiceId, status: "OPEN" },
+  });
+
+  if (match.exceptions.length > 0) {
+    await tx.invoiceMatchException.createMany({
+      data: match.exceptions.map((e) => ({
+        organizationId,
+        invoiceId,
+        invoiceLineId: e.invoiceLineId,
+        poLineItemId: e.poLineItemId,
+        type: e.type,
+        status: "OPEN" as const,
+        orderedQty: e.orderedQty,
+        receivedQty: e.receivedQty,
+        invoicedQty: e.invoicedQty,
+        orderedPrice: e.orderedPrice,
+        invoicedPrice: e.invoicedPrice,
+        variance: e.variance,
+        variancePct: e.variancePct,
+        tolerancePct: e.tolerancePct,
+        detail: e.detail,
+      })),
+    });
+  }
+
+  await tx.invoice.update({
+    where: { id: invoiceId },
+    data: {
+      matchStatus: match.status,
+      matchVariance: match.variance,
+      matchNotes: match.issues.length ? JSON.stringify(match.issues) : null,
+      matchedAt: new Date(),
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +420,7 @@ function computeTotals(lines: { quantity: number; unitPrice: number; taxRate: nu
 }
 
 export async function create(ctx: ServiceContext, input: CreateInput) {
-  await assertPermission(ctx.principal, "purchaseOrders.view");
+  await assertPermission(ctx.principal, "invoices.create");
   const organizationId = ctx.principal.organizationId;
   const tdb = scoped(ctx);
 
@@ -355,14 +527,7 @@ export async function create(ctx: ServiceContext, input: CreateInput) {
   });
 
   const match = await evaluateMatch(organizationId, invoice.id);
-  await db.invoice.update({
-    where: { id: invoice.id },
-    data: {
-      matchStatus: match.status,
-      matchVariance: match.variance,
-      matchNotes: match.issues.length ? JSON.stringify(match.issues) : null,
-    },
-  });
+  await db.$transaction((tx) => persistMatch(tx, organizationId, invoice.id, match));
 
   await recordAudit({
     organizationId,
@@ -420,7 +585,7 @@ export async function approve(ctx: ServiceContext, id: string, note?: string) {
   // Invoice approval is a finance control, gated on budget management rather than
   // request approval — a department manager who can approve a requisition should
   // not thereby be able to authorise paying a supplier.
-  await assertPermission(ctx.principal, "budgets.manage");
+  await assertPermission(ctx.principal, "invoices.approve");
 
   const organizationId = ctx.principal.organizationId;
   const tdb = scoped(ctx);
@@ -437,6 +602,14 @@ export async function approve(ctx: ServiceContext, id: string, note?: string) {
 
   const match = await evaluateMatch(organizationId, id);
 
+  // Approving an invoice recognises a liability. §23: the status change, the
+  // invoiced quantities, the match record and the budget movement are one
+  // operation — a liability recognised without the budget seeing it is exactly
+  // the kind of half-completed state the mandate rules out.
+  const nextStatus = transition("invoice", invoice.status, "APPROVED");
+  const departmentId =
+    invoice.purchaseOrder?.request?.departmentId ?? invoice.purchaseOrder?.departmentId ?? null;
+
   await db.$transaction(async (tx) => {
     // Advance invoiced quantities on the PO lines, so the fourth quantity in
     // ordered/received/invoiced/paid becomes true of the data.
@@ -448,32 +621,28 @@ export async function approve(ctx: ServiceContext, id: string, note?: string) {
       });
     }
 
+    await persistMatch(tx, organizationId, id, match);
+
     await tx.invoice.update({
       where: { id },
       data: {
-        status: "APPROVED",
+        status: nextStatus,
         approvedById: ctx.principal.userId,
         approvedAt: new Date(),
-        matchStatus: match.status,
-        matchVariance: match.variance,
-        matchNotes: match.issues.length ? JSON.stringify(match.issues) : null,
       },
     });
-  });
 
-  // Approving an invoice is the point at which committed budget becomes actual spend.
-  const departmentId = invoice.purchaseOrder?.request?.departmentId ?? null;
-  if (departmentId) {
-    await budgetEngine
-      .actualiseForInvoice(
+    if (departmentId) {
+      await budgetEngine.actualiseForInvoice(
         { organizationId, departmentId },
         invoice.totalAmount,
         invoice.id,
         invoice.purchaseOrderId,
-        ctx.principal.userId
-      )
-      .catch((err) => console.error("[invoice] budget actualisation failed", err));
-  }
+        ctx.principal.userId,
+        tx
+      );
+    }
+  });
 
   await recordAudit({
     organizationId,
@@ -528,7 +697,7 @@ export async function approve(ctx: ServiceContext, id: string, note?: string) {
 }
 
 export async function reject(ctx: ServiceContext, id: string, reason: string) {
-  await assertPermission(ctx.principal, "budgets.manage");
+  await assertPermission(ctx.principal, "invoices.reject");
   const tdb = scoped(ctx);
 
   const invoice = await tdb.invoice.findUnique({ where: { id }, include: { vendor: true } });
@@ -590,9 +759,17 @@ export async function refreshPaymentPosition(organizationId: string, invoiceId: 
   });
   if (!invoice) return;
 
-  const paid = invoice.payments
-    .filter((p) => p.status === "COMPLETED")
+  // Read from allocations, not from payment totals: a payment may settle several
+  // invoices, and only the part allocated to this one reduces its balance. The
+  // fallback covers payments recorded before allocations existed.
+  const allocations = await db.paymentAllocation.findMany({
+    where: { invoiceId, payment: { status: "COMPLETED" } },
+  });
+  const allocated = allocations.reduce((s, a) => s + a.amount, 0);
+  const unallocated = invoice.payments
+    .filter((p) => p.status === "COMPLETED" && !allocations.some((a) => a.paymentId === p.id))
     .reduce((s, p) => s + p.amount, 0);
+  const paid = allocated + unallocated;
 
   const balance = Math.max(0, invoice.totalAmount - paid);
 

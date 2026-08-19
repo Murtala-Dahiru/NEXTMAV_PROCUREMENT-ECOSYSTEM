@@ -61,7 +61,7 @@ export function RequestsView() {
       .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
   }, [requests, statusFilter, priorityFilter, deptFilter, search]);
 
-  const statuses: RequestStatus[] = ["DRAFT", "SUBMITTED", "UNDER_REVIEW", "APPROVED", "REJECTED", "CANCELLED", "COMPLETED"];
+  const statuses: RequestStatus[] = ["DRAFT", "SUBMITTED", "UNDER_REVIEW", "APPROVED", "RETURNED", "REJECTED", "CANCELLED", "IN_PROCUREMENT", "ORDERED", "PARTIALLY_FULFILLED", "FULFILLED", "CLOSED"];
   const priorities: Priority[] = ["LOW", "MEDIUM", "HIGH", "URGENT"];
 
   const handleRowClick = (id: string) => {

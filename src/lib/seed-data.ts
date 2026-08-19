@@ -824,7 +824,7 @@ export const seedRequests: PurchaseRequest[] = [
     title: "Steel Rebar — Plant 2 Construction Phase 2",
     departmentId: "dep_eng",
     requestedById: "usr_emeka",
-    status: "COMPLETED",
+    status: "CLOSED",
     priority: "URGENT",
     category: "Construction Materials",
     tags: ["construction", "plant-2", "phase-2"],

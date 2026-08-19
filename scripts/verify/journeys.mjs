@@ -13,6 +13,11 @@
 // Run:  npm run verify:journeys      (dev server must be running)
 
 const BASE = process.env.BASE_URL ?? "http://localhost:3100";
+
+// Supplier invoice references are unique per vendor per organization — that
+// duplicate guard is one of the controls under test. Each run therefore mints
+// its own, so a second run does not collide with the first.
+const RUN = Date.now().toString().slice(-6);
 const PASSWORD = "NextMav#2026";
 
 let pass = 0, fail = 0;
@@ -81,14 +86,46 @@ class Client {
 const iso = (daysFromNow = 0) => new Date(Date.now() + daysFromNow * 86400_000).toISOString();
 const money = (n) => Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 });
 
+/**
+ * Numeric columns are `numeric` in Postgres, and this harness opens its own
+ * unextended Prisma client, so they arrive as Decimal objects. `a > b` on two of
+ * those compares their string forms — "18080" > "9040" is false — so every figure
+ * read straight from the database goes through here first.
+ */
+const num = (v) => (v === null || v === undefined ? v : Number(v));
+
+function numeric(row, ...fields) {
+  if (!row) return row;
+  const out = { ...row };
+  for (const f of fields) out[f] = num(row[f]);
+  return out;
+}
+
+let sharedDb = null;
+async function database() {
+  if (!sharedDb) {
+    const { PrismaClient } = await import("@prisma/client");
+    sharedDb = new PrismaClient({ log: ["error"] });
+  }
+  return sharedDb;
+}
+
 async function budgetSnapshot(departmentId) {
-  const { PrismaClient } = await import("@prisma/client");
-  const db = new PrismaClient({ log: ["error"] });
+  const db = await database();
   const b = await db.budget.findFirst({
     where: { departmentId, fiscalYear: new Date().getFullYear() },
   });
-  await db.$disconnect();
-  return b;
+  return numeric(
+    b,
+    "totalAmount",
+    "requestedAmount",
+    "reservedAmount",
+    "committedAmount",
+    "spentAmount",
+    "invoicedAmount",
+    "paidAmount",
+    "remainingAmount"
+  );
 }
 
 async function main() {
@@ -230,7 +267,8 @@ async function main() {
     quotationId: lowestRow.quotationId,
     justification: "Lowest total cost; delivery acceptable against the needed-by date.",
   });
-  check(award.status === 200 && award.body?.status === "CLOSED", "RFQ awarded and closed", award.body?.status);
+  // AWARDED rather than CLOSED: the award is a decision, closing is administrative.
+  check(award.status === 200 && award.body?.status === "AWARDED", "RFQ awarded", award.body?.status);
   check(
     award.body?.quotations?.filter((q) => q.status === "REJECTED").length === 2,
     "losing bids marked rejected"
@@ -245,9 +283,9 @@ async function main() {
 
   const requestAfterPo = (await tunde.get(`/api/requests/${request.id}`)).body;
   check(
-    requestAfterPo?.status === "APPROVED",
-    "request is NOT closed merely because a PO was issued",
-    `status ${requestAfterPo?.status} (the old build marked this COMPLETED)`
+    requestAfterPo?.status === "ORDERED",
+    "request moves to ORDERED on PO issue, and is not closed by it",
+    `status ${requestAfterPo?.status}`
   );
 
   const budgetAfterPo = await budgetSnapshot("dep_eng");
@@ -291,7 +329,7 @@ async function main() {
   });
   check(overReceive.status === 422, "receiving more than ordered is rejected", `HTTP ${overReceive.status}: ${overReceive.body?.error?.message?.slice(0, 80) ?? ""}`);
 
-  const invBefore = (await budgetSnapshotInventory("inv_item_001")).quantity;
+  const invBefore = num((await budgetSnapshotInventory("inv_item_001")).quantity);
 
   // --- partial receipt
   const partial = await tunde.post("/api/goods-receipts", {
@@ -309,7 +347,7 @@ async function main() {
   let poBState = (await tunde.get(`/api/purchase-orders/${poB.id}`)).body;
   check(poBState?.status === "PARTIALLY_RECEIVED", "PO status derived as PARTIALLY_RECEIVED", poBState?.status);
 
-  const invAfterPartial = (await budgetSnapshotInventory("inv_item_001")).quantity;
+  const invAfterPartial = num((await budgetSnapshotInventory("inv_item_001")).quantity);
   check(
     invAfterPartial === invBefore + 12,
     "receipt posted a stock movement into inventory",
@@ -344,9 +382,9 @@ async function main() {
     assets.every((a) => a.purchaseOrderId === poB.id && a.goodsReceiptId && a.vendorId === "vnd_safetync"),
     "each asset traces back to its PO, receipt and vendor"
   );
-  check(assets.every((a) => a.purchaseValue === 1800), "asset carries the purchase value from the PO line");
+  check(assets.every((a) => num(a.purchaseValue) === 1800), "asset carries the purchase value from the PO line");
 
-  const invFinal = (await budgetSnapshotInventory("inv_item_001")).quantity;
+  const invFinal = num((await budgetSnapshotInventory("inv_item_001")).quantity);
   check(
     invFinal === invBefore + 18,
     "damaged units did NOT enter stock",
@@ -364,7 +402,7 @@ async function main() {
   // --- an invoice that overbills should be caught by the match
   const badInvoice = (await fatima.post("/api/invoices", {
     vendorId: "vnd_safetync",
-    vendorInvoiceRef: "SNC-OVER-1",
+    vendorInvoiceRef: `SNC-OVER-${RUN}`,
     purchaseOrderId: poB.id,
     issueDate: iso(0),
     dueDate: iso(30),
@@ -383,7 +421,7 @@ async function main() {
   // --- a price variance
   const priceVar = (await fatima.post("/api/invoices", {
     vendorId: "vnd_safetync",
-    vendorInvoiceRef: "SNC-PRICE-1",
+    vendorInvoiceRef: `SNC-PRICE-${RUN}`,
     purchaseOrderId: poB.id,
     issueDate: iso(0),
     dueDate: iso(30),
@@ -401,7 +439,7 @@ async function main() {
   // --- duplicate detection
   const dup = await fatima.post("/api/invoices", {
     vendorId: "vnd_safetync",
-    vendorInvoiceRef: "SNC-PRICE-1",
+    vendorInvoiceRef: `SNC-PRICE-${RUN}`,
     purchaseOrderId: poB.id,
     issueDate: iso(0),
     dueDate: iso(30),
@@ -426,7 +464,7 @@ async function main() {
 
   const cleanInvoice = (await fatima.post("/api/invoices", {
     vendorId: poAFull.vendorId,
-    vendorInvoiceRef: "GEQ-2026-5512",
+    vendorInvoiceRef: `GEQ-${RUN}`,
     purchaseOrderId: poA.id,
     issueDate: iso(0),
     dueDate: iso(30),
@@ -522,8 +560,8 @@ async function main() {
 
   const finalRequest = (await tunde.get(`/api/requests/${request.id}`)).body;
   check(
-    finalRequest?.status === "COMPLETED",
-    "request completes only once goods are received AND the invoice is paid",
+    finalRequest?.status === "CLOSED",
+    "request closes only once goods are received AND the invoice is paid",
     finalRequest?.status
   );
 
@@ -540,8 +578,11 @@ async function main() {
     "the full chain is represented in the ledger",
     kinds.join(", ")
   );
+  // `e.amount` is a Decimal read straight from the database, and `+` on two of
+  // those concatenates their string forms: three entries of 9,040 reduce to
+  // 904,090,409,040 rather than 27,120. Convert first.
   const recomputed = ledger.reduce((acc, e) => {
-    acc[e.type] = (acc[e.type] ?? 0) + e.amount;
+    acc[e.type] = (acc[e.type] ?? 0) + num(e.amount);
     return acc;
   }, {});
   check(
@@ -583,6 +624,7 @@ async function main() {
   check(!!approvalAudit?.before && !!approvalAudit?.after, "state transitions capture before and after");
 
   // -------------------------------------------------------------------------
+  await sharedDb?.$disconnect();
   console.log(`\n${"─".repeat(72)}`);
   console.log(`\x1b[1m${pass} passed, ${fail} failed\x1b[0m`);
   if (failures.length) {
@@ -594,9 +636,10 @@ async function main() {
 
 // --- direct database readers used only to assert side effects -------------
 async function withDb(fn) {
-  const { PrismaClient } = await import("@prisma/client");
-  const db = new PrismaClient({ log: ["error"] });
-  try { return await fn(db); } finally { await db.$disconnect(); }
+  // The client is shared and closed once, at the end of the run: disconnecting
+  // after every read burns a pooler connection per call, and a hosted pooler
+  // eventually refuses the next one.
+  return fn(await database());
 }
 const budgetSnapshotInventory = (id) => withDb((db) => db.inventoryItem.findUnique({ where: { id } }));
 const assetsForPo = (poId) => withDb((db) => db.asset.findMany({ where: { purchaseOrderId: poId } }));

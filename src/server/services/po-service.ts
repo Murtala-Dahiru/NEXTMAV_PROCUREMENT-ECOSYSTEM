@@ -10,14 +10,16 @@
 //  2. PO status is *derived* from cumulative receipts rather than set by hand, so
 //     a PO cannot claim to be RECEIVED while lines are still outstanding.
 
-import type { Prisma, PurchaseOrderStatus } from "@prisma/client";
-import { db } from "../db";
-import { conflict, notFound, validation } from "../errors";
+import type { Prisma, PurchaseOrderStatus, RequestStatus } from "@prisma/client";
+import { db, type Numeric } from "../db";
+import { conflict, notFound, validation, forbidden } from "../errors";
 import { assertPermission } from "../permissions";
 import { recordActivity, recordAudit } from "../audit";
 import { nextDocumentNumber, PREFIX } from "../numbering";
 import { emit } from "../engines/events";
 import * as budgetEngine from "../engines/budget";
+import { canTransition, transition } from "../state-machine";
+import { enqueue } from "../engines/outbox";
 import { orderBy, paginate, scoped, type Page, type ServiceContext } from "./context";
 import type {
   createPoSchema,
@@ -155,7 +157,7 @@ export async function getById(ctx: ServiceContext, id: string) {
  * ordered ≠ received ≠ invoiced ≠ paid.
  */
 export function fulfilmentSummary(
-  po: Prisma.PurchaseOrderGetPayload<{ include: typeof poInclude }>
+  po: Numeric<Prisma.PurchaseOrderGetPayload<{ include: typeof poInclude }>>
 ) {
   const lines = po.lineItems.map((li) => ({
     id: li.id,
@@ -213,9 +215,15 @@ export async function create(ctx: ServiceContext, input: CreateInput) {
   if (input.requestId) {
     request = await tdb.purchaseRequest.findUnique({ where: { id: input.requestId } });
     if (!request) throw validation("The linked purchase request does not exist");
-    if (request.status !== "APPROVED" && request.status !== "COMPLETED") {
+    const orderable: RequestStatus[] = [
+      "APPROVED",
+      "IN_PROCUREMENT",
+      "ORDERED",
+      "PARTIALLY_FULFILLED",
+    ];
+    if (!orderable.includes(request.status)) {
       throw conflict(
-        `A purchase order can only be raised against an approved request — ${request.requestNumber} is ${request.status.toLowerCase()}`
+        `A purchase order can only be raised against an approved request — ${request.requestNumber} is ${request.status.replace(/_/g, " ").toLowerCase()}`
       );
     }
   }
@@ -234,6 +242,12 @@ export async function create(ctx: ServiceContext, input: CreateInput) {
         quotationId: input.quotationId ?? null,
         contractId: input.contractId ?? null,
         vendorId: input.vendorId,
+        // Finance coding is inherited from the request so spend is reportable
+        // against the same department, cost centre and budget that approved it.
+        departmentId: request?.departmentId ?? null,
+        costCenterId: request?.costCenterId ?? null,
+        budgetId: request?.budgetId ?? null,
+        categoryId: request?.categoryId ?? null,
         status: input.issue ? "ISSUED" : "DRAFT",
         subtotal: amounts.subtotal,
         taxRate: input.taxRate,
@@ -299,22 +313,126 @@ export async function create(ctx: ServiceContext, input: CreateInput) {
 }
 
 /** Issues a draft PO: commits budget, updates the vendor, notifies the supplier. */
+/**
+ * Submits a purchase order for approval.
+ *
+ * Separates "the buyer has finished writing it" from "the organization has
+ * agreed to spend the money", which is the control an approval gate exists to
+ * provide.
+ */
+export async function submitForApproval(ctx: ServiceContext, id: string) {
+  await assertPermission(ctx.principal, "purchaseOrders.create");
+  const tdb = scoped(ctx);
+
+  const po = await tdb.purchaseOrder.findUnique({ where: { id } });
+  if (!po) throw notFound("Purchase order not found");
+
+  const next = transition("purchaseOrder", po.status, "PENDING_APPROVAL");
+  await tdb.purchaseOrder.update({ where: { id }, data: { status: next } });
+
+  await recordAudit({
+    organizationId: ctx.principal.organizationId,
+    userId: ctx.principal.userId,
+    action: "po.submitted_for_approval",
+    resource: "PurchaseOrder",
+    resourceId: id,
+    before: { status: po.status },
+    after: { status: next },
+    context: ctx.context,
+  });
+
+  return getById(ctx, id);
+}
+
+/**
+ * Approves a purchase order.
+ *
+ * Separation of duties: whoever raised the order cannot be the one who approves
+ * it. The same rule already governs payments, and it matters more here — this is
+ * the point at which the organization commits money to a vendor.
+ */
+export async function approve(ctx: ServiceContext, id: string, comment?: string) {
+  await assertPermission(ctx.principal, "purchaseOrders.approve");
+  const tdb = scoped(ctx);
+
+  const po = await tdb.purchaseOrder.findUnique({ where: { id }, include: { vendor: true } });
+  if (!po) throw notFound("Purchase order not found");
+
+  if (po.createdById && po.createdById === ctx.principal.userId) {
+    throw forbidden(
+      "You raised this purchase order, so you cannot also approve it. Separation of duties requires a second person."
+    );
+  }
+  if (po.vendor.status === "BLACKLISTED") {
+    throw conflict(`${po.vendor.companyName} is blacklisted — this order cannot be approved`);
+  }
+
+  const next = transition("purchaseOrder", po.status, "APPROVED");
+  await tdb.purchaseOrder.update({
+    where: { id },
+    data: { status: next, approvedById: ctx.principal.userId, approvedAt: new Date() },
+  });
+
+  await recordAudit({
+    organizationId: ctx.principal.organizationId,
+    userId: ctx.principal.userId,
+    action: "po.approved",
+    resource: "PurchaseOrder",
+    resourceId: id,
+    before: { status: po.status },
+    after: { status: next, comment: comment ?? null },
+    context: ctx.context,
+  });
+
+  return getById(ctx, id);
+}
+
+/** Rejects a purchase order that was sent for approval, with a reason. */
+export async function reject(ctx: ServiceContext, id: string, reason: string) {
+  await assertPermission(ctx.principal, "purchaseOrders.approve");
+  const tdb = scoped(ctx);
+
+  const po = await tdb.purchaseOrder.findUnique({ where: { id } });
+  if (!po) throw notFound("Purchase order not found");
+
+  const next = transition("purchaseOrder", po.status, "REJECTED");
+  await tdb.purchaseOrder.update({
+    where: { id },
+    data: { status: next, rejectedAt: new Date(), rejectionReason: reason },
+  });
+
+  await recordAudit({
+    organizationId: ctx.principal.organizationId,
+    userId: ctx.principal.userId,
+    action: "po.rejected",
+    resource: "PurchaseOrder",
+    resourceId: id,
+    before: { status: po.status },
+    after: { status: next, reason },
+    context: ctx.context,
+  });
+
+  return getById(ctx, id);
+}
+
 export async function issue(ctx: ServiceContext, id: string) {
   await assertPermission(ctx.principal, "purchaseOrders.issue");
   const tdb = scoped(ctx);
 
   const po = await tdb.purchaseOrder.findUnique({ where: { id }, include: { vendor: true } });
   if (!po) throw notFound("Purchase order not found");
-  if (po.status !== "DRAFT" && po.status !== "PENDING_APPROVAL") {
-    throw conflict(`This purchase order is already ${po.status.replace(/_/g, " ").toLowerCase()}`);
-  }
   if (po.vendor.status === "BLACKLISTED") {
     throw conflict(`${po.vendor.companyName} is blacklisted — this order cannot be issued`);
   }
 
+  // DRAFT → ISSUED is legal for organizations that do not gate POs separately;
+  // PENDING_APPROVAL → ISSUED is not, because that order is waiting on a decision
+  // that has not been made. The state machine is what draws that line.
+  const next = transition("purchaseOrder", po.status, "ISSUED");
+
   await tdb.purchaseOrder.update({
     where: { id },
-    data: { status: "ISSUED", issuedAt: new Date() },
+    data: { status: next, issuedAt: new Date() },
   });
 
   await recordAudit({
@@ -340,29 +458,41 @@ async function afterIssue(ctx: ServiceContext, poId: string) {
   });
   if (!po) return;
 
-  // Commit budget against the requesting department, converting any reservation
-  // the approved request was holding.
-  const departmentId = po.request?.departmentId ?? null;
-  if (departmentId) {
-    await budgetEngine
-      .commitForPurchaseOrder(
+  // Committing the budget, moving the request on and updating the supplier's
+  // order book are one operation: an order that exists without a commitment
+  // against it is a hole in the budget position.
+  const departmentId = po.request?.departmentId ?? po.departmentId ?? null;
+
+  await db.$transaction(async (tx) => {
+    if (departmentId) {
+      await budgetEngine.commitForPurchaseOrder(
         { organizationId: po.organizationId, departmentId },
         po.totalAmount,
         po.id,
         po.requestId,
-        ctx.principal.userId
-      )
-      .catch((err) => console.error("[po] budget commitment failed", err));
-  }
+        ctx.principal.userId,
+        tx
+      );
+    }
 
-  await db.vendor.update({
-    where: { id: po.vendorId },
-    data: {
-      totalOrders: { increment: 1 },
-      totalValue: { increment: po.totalAmount },
-      // Ordering from a prospective vendor makes them an active supplier.
-      ...(po.vendor.status === "PROSPECTIVE" ? { status: "ACTIVE" as const } : {}),
-    },
+    await tx.vendor.update({
+      where: { id: po.vendorId },
+      data: {
+        totalOrders: { increment: 1 },
+        totalValue: { increment: po.totalAmount },
+        // Ordering from a prospective vendor makes them an active supplier.
+        ...(po.vendor.status === "PROSPECTIVE" ? { status: "ACTIVE" as const } : {}),
+      },
+    });
+
+    // The request is now on order. Its own fulfilment states are driven from the
+    // receipts that follow.
+    if (po.request && canTransition("request", po.request.status, "ORDERED")) {
+      await tx.purchaseRequest.update({
+        where: { id: po.request.id },
+        data: { status: "ORDERED", orderedAt: po.request.orderedAt ?? new Date() },
+      });
+    }
   });
 
   await recordActivity({

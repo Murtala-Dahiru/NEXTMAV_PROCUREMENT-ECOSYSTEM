@@ -75,7 +75,7 @@ export function ReportsView() {
   const approvalRate = approved + rejected > 0 ? Math.round((approved / (approved + rejected)) * 100) : 0;
 
   // Status distribution
-  const statusDist = ["DRAFT", "SUBMITTED", "UNDER_REVIEW", "APPROVED", "REJECTED", "COMPLETED", "CANCELLED"].map((s) => ({
+  const statusDist = ["DRAFT", "SUBMITTED", "UNDER_REVIEW", "APPROVED", "REJECTED", "ORDERED", "FULFILLED", "CLOSED", "CANCELLED"].map((s) => ({
     name: s.charAt(0) + s.slice(1).toLowerCase().replace("_", " "),
     count: requests.filter((r) => r.status === s).length,
   })).filter((x) => x.count > 0);

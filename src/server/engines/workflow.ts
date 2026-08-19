@@ -16,8 +16,8 @@
 // Stages sharing a `sequence` are parallel: all of them must approve before the
 // chain moves on. A rejection at any point ends the chain.
 
-import type { ApprovalDecision, Prisma, UserRole } from "@prisma/client";
-import { db } from "../db";
+import type { ApprovalDecision, ApprovalEntityType, Prisma, UserRole } from "@prisma/client";
+import { db, type Numeric } from "../db";
 import { conflict, notFound } from "../errors";
 
 export interface RequestFacts {
@@ -28,7 +28,7 @@ export interface RequestFacts {
   category: string | null;
 }
 
-type WorkflowWithStages = Prisma.ApprovalWorkflowGetPayload<{ include: { stages: true } }>;
+type WorkflowWithStages = Numeric<Prisma.ApprovalWorkflowGetPayload<{ include: { stages: true } }>>;
 
 function matchesJsonFilter(raw: string | null, value: string | null): boolean {
   // A null filter means "no constraint on this dimension".
@@ -49,9 +49,19 @@ function matchesJsonFilter(raw: string | null, value: string | null): boolean {
  * band. A workflow bounded to ≤ $25,000 is more specific than an unbounded one
  * and must win for a $3,000 request.
  */
-export async function selectWorkflow(facts: RequestFacts): Promise<WorkflowWithStages | null> {
+export async function selectWorkflow(
+  facts: RequestFacts,
+  entityType: ApprovalEntityType = "REQUEST"
+): Promise<WorkflowWithStages | null> {
   const candidates = await db.approvalWorkflow.findMany({
-    where: { organizationId: facts.organizationId, isActive: true },
+    where: {
+      organizationId: facts.organizationId,
+      isActive: true,
+      entityType: entityType ?? "REQUEST",
+      // A superseded version keeps governing the approvals that started under it,
+      // but never picks up a new one.
+      supersededById: null,
+    },
     include: { stages: { orderBy: { sequence: "asc" } } },
   });
 
@@ -78,9 +88,13 @@ export async function selectWorkflow(facts: RequestFacts): Promise<WorkflowWithS
 
 export interface PlannedStep {
   stage: WorkflowWithStages["stages"][number]["stage"];
+  /** The configured stage this step came from, so the chain stays explicable. */
+  stageId: string;
   sequence: number;
   approverId: string;
   approverRole: UserRole;
+  /** Set when the stage targets a configured role rather than the legacy enum. */
+  approverRoleId: string | null;
   slaHours: number;
   slaExpiresAt: Date;
 }
@@ -99,13 +113,44 @@ async function resolveApprover(
   organizationId: string,
   role: UserRole,
   departmentId: string | null,
-  excludeUserId: string | null
+  excludeUserId: string | null,
+  roleId?: string | null
 ): Promise<{ id: string; role: UserRole } | null> {
+  const exclude = excludeUserId ? { id: { not: excludeUserId } } : {};
+
+  // A stage targeting a configured role resolves through role assignments. This
+  // is what lets an organization route approval to "Category Buyer" — a role the
+  // enum has never heard of — without a code change.
+  if (roleId) {
+    const now = new Date();
+    const holders = await db.user.findMany({
+      where: {
+        organizationId,
+        status: "ACTIVE",
+        ...exclude,
+        roleAssignments: {
+          some: {
+            roleId,
+            role: { isActive: true },
+            OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+          },
+        },
+      },
+      orderBy: { createdAt: "asc" },
+    });
+
+    // Prefer a holder scoped to the requesting department over an org-wide one,
+    // so an Engineering request is approved by Engineering's holder of the role.
+    const departmental = departmentId ? holders.find((h) => h.departmentId === departmentId) : null;
+    const chosen = departmental ?? holders[0];
+    if (chosen) return { id: chosen.id, role: chosen.role };
+  }
+
   const base = {
     organizationId,
     role,
     status: "ACTIVE" as const,
-    ...(excludeUserId ? { id: { not: excludeUserId } } : {}),
+    ...exclude,
   };
 
   if (departmentId && role === "DEPARTMENT_MANAGER") {
@@ -118,6 +163,38 @@ async function resolveApprover(
 
   const anyHolder = await db.user.findFirst({ where: base, orderBy: { createdAt: "asc" } });
   return anyHolder ? { id: anyHolder.id, role: anyHolder.role } : null;
+}
+
+/**
+ * Redirects an approval to whoever is standing in for the assigned approver.
+ *
+ * A standing delegation ("while I am on leave, my approvals go to Chidi") is
+ * configuration, so it is applied when the chain is built rather than requiring
+ * the delegator to be present to forward each step by hand.
+ */
+async function applyStandingDelegation(
+  organizationId: string,
+  userId: string
+): Promise<string> {
+  const now = new Date();
+  const delegation = await db.approvalDelegation.findFirst({
+    where: {
+      organizationId,
+      fromUserId: userId,
+      isActive: true,
+      startsAt: { lte: now },
+      OR: [{ endsAt: null }, { endsAt: { gte: now } }],
+      AND: [{ OR: [{ entityType: null }, { entityType: "REQUEST" }] }],
+    },
+    orderBy: { startsAt: "desc" },
+  });
+  if (!delegation) return userId;
+
+  const delegate = await db.user.findFirst({
+    where: { id: delegation.toUserId, organizationId, status: "ACTIVE" },
+    select: { id: true },
+  });
+  return delegate ? delegate.id : userId;
 }
 
 /**
@@ -142,7 +219,8 @@ export async function buildChain(
       facts.organizationId,
       stage.approverRole,
       facts.departmentId,
-      requesterId
+      requesterId,
+      stage.approverRoleId
     );
     if (!approver) {
       // A stage with nobody to perform it would deadlock the request. Skipping it
@@ -154,11 +232,15 @@ export async function buildChain(
       );
     }
 
+    const assignedTo = await applyStandingDelegation(facts.organizationId, approver.id);
+
     planned.push({
       stage: stage.stage,
+      stageId: stage.id,
       sequence: stage.sequence,
-      approverId: approver.id,
+      approverId: assignedTo,
       approverRole: stage.approverRole,
+      approverRoleId: stage.approverRoleId,
       slaHours: stage.slaHours,
       slaExpiresAt: new Date(now + stage.slaHours * 3600 * 1000),
     });
@@ -242,6 +324,15 @@ export function assertCanDecide(
   }
 
   return { step, state };
+}
+
+/** Whether every stage of a chain has been decided, for a generic instance. */
+export async function instanceState(instanceId: string) {
+  const steps = await db.approvalStep.findMany({
+    where: { instanceId },
+    orderBy: { sequence: "asc" },
+  });
+  return { steps, state: chainState(steps) };
 }
 
 /** Steps whose SLA has lapsed and that have not yet been escalated. */

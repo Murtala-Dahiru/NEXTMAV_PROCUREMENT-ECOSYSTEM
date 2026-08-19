@@ -10,9 +10,13 @@
 //
 // The previous implementation logged a hardcoded IP literal ("102.89.45.10") from
 // the browser. Request metadata is now taken from the actual request headers.
+//
+// State snapshots are stored as jsonb rather than as stringified JSON, so an
+// auditor can query "every change that touched totalAmount" in SQL instead of
+// pattern-matching text.
 
 import { headers } from "next/headers";
-import type { Severity } from "@prisma/client";
+import type { Prisma, Severity } from "@prisma/client";
 import { db } from "./db";
 
 export interface RequestContext {
@@ -42,13 +46,33 @@ export async function requestContext(): Promise<RequestContext> {
   }
 }
 
-function serialise(value: unknown): string | null {
-  if (value === undefined || value === null) return null;
+/**
+ * Normalises a snapshot for jsonb storage.
+ *
+ * Dates become ISO strings and bigints become decimal strings, because both are
+ * lossy or invalid in JSON; everything else is stored as-is so the shape of the
+ * record survives into the audit row.
+ */
+function toJson(value: unknown): Prisma.InputJsonValue | undefined {
+  if (value === undefined || value === null) return undefined;
   try {
-    return JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+    return JSON.parse(
+      JSON.stringify(value, (_k, v) =>
+        typeof v === "bigint" ? v.toString() : v instanceof Date ? v.toISOString() : v
+      )
+    ) as Prisma.InputJsonValue;
   } catch {
-    return null;
+    return undefined;
   }
+}
+
+function changedKeys(before: unknown, after: unknown): string[] {
+  if (!before || !after || typeof before !== "object" || typeof after !== "object") {
+    return after && typeof after === "object" ? Object.keys(after as object) : [];
+  }
+  const b = before as Record<string, unknown>;
+  const a = after as Record<string, unknown>;
+  return Object.keys(a).filter((k) => JSON.stringify(b[k]) !== JSON.stringify(a[k]));
 }
 
 export interface AuditInput {
@@ -83,8 +107,9 @@ export async function recordAudit(input: AuditInput): Promise<void> {
         action: input.action,
         resource: input.resource,
         resourceId: input.resourceId ?? null,
-        before: serialise(input.before),
-        after: serialise(input.after),
+        before: toJson(input.before),
+        after: toJson(input.after),
+        changedFields: changedKeys(input.before, input.after),
         ipAddress: ctx.ipAddress,
         userAgent: ctx.userAgent,
       },
@@ -127,7 +152,7 @@ export async function recordActivity(input: ActivityInput): Promise<void> {
         purchaseOrderId: input.purchaseOrderId ?? null,
         rfqId: input.rfqId ?? null,
         vendorId: input.vendorId ?? null,
-        metadata: serialise(input.metadata),
+        metadata: toJson(input.metadata),
         ipAddress: ctx.ipAddress,
         userAgent: ctx.userAgent,
       },

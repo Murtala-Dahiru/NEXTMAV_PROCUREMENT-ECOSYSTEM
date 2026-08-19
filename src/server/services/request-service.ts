@@ -2,8 +2,12 @@
 //
 // The request lifecycle, moved off the browser and made authoritative:
 //
-//   DRAFT → SUBMITTED → UNDER_REVIEW → APPROVED → (PO issued) → COMPLETED
-//                    ↘ REJECTED   ↘ CANCELLED
+//   DRAFT → SUBMITTED → UNDER_REVIEW → APPROVED → IN_PROCUREMENT → ORDERED
+//         → PARTIALLY_FULFILLED → FULFILLED → CLOSED
+//                    ↘ REJECTED   ↘ RETURNED   ↘ CANCELLED
+//
+// Every status change goes through the state machine in `state-machine.ts`, so a
+// document cannot skip a stage or be revived from a terminal state.
 //
 // Three corrections to the previous behaviour are load-bearing:
 //
@@ -25,6 +29,8 @@ import { nextDocumentNumber, PREFIX } from "../numbering";
 import { emit } from "../engines/events";
 import * as workflow from "../engines/workflow";
 import * as budget from "../engines/budget";
+import { enqueue } from "../engines/outbox";
+import { canTransition, nextStates, transition } from "../state-machine";
 import { orderBy, paginate, scoped, type Page, type ServiceContext } from "./context";
 import type {
   createRequestSchema,
@@ -155,6 +161,9 @@ export async function myApprovalQueue(ctx: ServiceContext) {
   // Only surface steps that are genuinely actionable — a step at sequence 3 is not
   // the approver's problem while sequence 2 is still outstanding.
   return steps.filter((step) => {
+    // Steps raised by a non-request approval instance (a PO, an invoice) have no
+    // request to walk; they are surfaced by their own service.
+    if (!step.request) return false;
     const state = workflow.chainState(step.request.approvals);
     return state.activeSteps.some((a) => a.id === step.id);
   });
@@ -355,8 +364,18 @@ export async function submit(ctx: ServiceContext, id: string) {
 
   await assertOwnerOrPermission(ctx.principal, request.requestedById, "requests.edit.all");
 
-  if (request.status !== "DRAFT") {
-    throw conflict(`Only a draft can be submitted — this request is ${request.status.toLowerCase()}`);
+  // A returned request is submitted the same way a draft is: that is the whole
+  // point of returning it rather than rejecting it. The state machine is the
+  // authority on which statuses can move to SUBMITTED, so this does not restate
+  // the rule — it asks.
+  //
+  // `nextStates` rather than `canTransition`, because the latter treats a move to
+  // the status you are already in as legal. Here that would let a request already
+  // under approval be re-submitted, discarding decisions people had made.
+  if (!nextStates("request", request.status).includes("SUBMITTED")) {
+    throw conflict(
+      `A request that is ${request.status.replace(/_/g, " ").toLowerCase()} cannot be submitted for approval`
+    );
   }
   if (request.lineItems.length === 0) {
     throw validation("A request must have at least one line item before submission");
@@ -383,26 +402,85 @@ export async function submit(ctx: ServiceContext, id: string) {
   }
 
   const now = new Date();
+  const nextStatus = transition("request", request.status, "SUBMITTED");
+  const firstSequence = Math.min(...chain.map((c) => c.sequence));
+
   const updated = await db.$transaction(async (tx) => {
-    await tx.approvalStep.deleteMany({ where: { requestId: id } });
+    // A resubmission starts a fresh instance; the previous one stays as history.
+    await tx.approvalInstance.updateMany({
+      where: { requestId: id, status: "IN_PROGRESS" },
+      data: { status: "CANCELLED", completedAt: now, outcomeReason: "Superseded by resubmission" },
+    });
+    await tx.approvalStep.deleteMany({ where: { requestId: id, decision: "PENDING" } });
+
+    const instance = await tx.approvalInstance.create({
+      data: {
+        organizationId: ctx.principal.organizationId,
+        workflowId: selected.id,
+        entityType: "REQUEST",
+        entityId: id,
+        requestId: id,
+        status: "IN_PROGRESS",
+        amount: request.totalEstimated,
+        currency: request.currency,
+        context: {
+          priority: request.priority,
+          departmentId: request.departmentId,
+          category: request.category,
+          workflowVersion: selected.version,
+        },
+      },
+    });
+
     await tx.approvalStep.createMany({
       data: chain.map((s) => ({
+        instanceId: instance.id,
         requestId: id,
+        stageId: s.stageId,
         stage: s.stage,
         sequence: s.sequence,
         approverId: s.approverId,
         approverRole: s.approverRole,
+        approverRoleId: s.approverRoleId,
         decision: "PENDING" as const,
         slaHours: s.slaHours,
         slaExpiresAt: s.slaExpiresAt,
       })),
     });
 
-    return tx.purchaseRequest.update({
+    // The demand signal: money asked for, not yet claimed. Recorded on submission
+    // so a department's pipeline is visible before anything is approved.
+    if (request.departmentId) {
+      await budget.signalRequested(
+        { organizationId: ctx.principal.organizationId, departmentId: request.departmentId },
+        request.totalEstimated,
+        id,
+        ctx.principal.userId,
+        tx
+      );
+    }
+
+    const saved = await tx.purchaseRequest.update({
       where: { id },
-      data: { status: "SUBMITTED", submittedAt: now, workflowId: selected.id },
+      data: { status: nextStatus, submittedAt: now, workflowId: selected.id, returnedAt: null, returnReason: null },
       include: requestInclude,
     });
+
+    await enqueue(tx, {
+      type: "request.approval_required",
+      organizationId: ctx.principal.organizationId,
+      actorId: ctx.principal.userId,
+      recipientIds: chain.filter((c) => c.sequence === firstSequence).map((c) => c.approverId),
+      title: `Approval required — ${request.requestNumber}`,
+      message: `${ctx.principal.name} submitted "${request.title}" (${request.totalEstimated.toLocaleString()}) for your approval.`,
+      severity: "approval",
+      link: "approvals",
+      entityType: "REQUEST",
+      entityId: id,
+      payload: { requestNumber: request.requestNumber, amount: request.totalEstimated },
+    });
+
+    return saved;
   });
 
   await recordAudit({
@@ -422,22 +500,6 @@ export async function submit(ctx: ServiceContext, id: string) {
     description: `${ctx.principal.name} submitted ${request.requestNumber}: '${request.title}' into "${selected.name}"`,
     requestId: id,
     context: ctx.context,
-  });
-
-  // Notify only the approvers at the first active sequence.
-  const firstSequence = Math.min(...chain.map((c) => c.sequence));
-  await emit({
-    type: "request.approval_required",
-    organizationId: ctx.principal.organizationId,
-    actorId: ctx.principal.userId,
-    recipientIds: chain.filter((c) => c.sequence === firstSequence).map((c) => c.approverId),
-    title: `Approval required — ${request.requestNumber}`,
-    message: `${ctx.principal.name} submitted "${request.title}" (${request.totalEstimated.toLocaleString()}) for your approval.`,
-    severity: "approval",
-    link: "approvals",
-    entityType: "REQUEST",
-    entityId: id,
-    payload: { requestNumber: request.requestNumber, amount: request.totalEstimated },
   });
 
   return updated;
@@ -481,48 +543,73 @@ export async function decide(ctx: ServiceContext, requestId: string, input: Deci
     });
     const state = workflow.chainState(steps);
 
-    let nextStatus: RequestStatus;
-    if (input.decision === "REJECTED") nextStatus = "REJECTED";
-    else if (input.decision === "CHANGES_REQUESTED") nextStatus = "DRAFT";
-    else nextStatus = state.isComplete ? "APPROVED" : "UNDER_REVIEW";
+    // "Changes requested" returns the request to its owner for revision. It is
+    // not a rejection and not a draft that was never submitted, so it has its own
+    // state — the requester can see why it came back.
+    let target: RequestStatus;
+    if (input.decision === "REJECTED") target = "REJECTED";
+    else if (input.decision === "CHANGES_REQUESTED") target = "RETURNED";
+    else target = state.isComplete ? "APPROVED" : "UNDER_REVIEW";
+
+    const nextStatus = transition("request", request.status, target);
 
     // Requesting changes voids the remaining chain — it must be re-submitted.
     if (input.decision === "CHANGES_REQUESTED") {
       await tx.approvalStep.deleteMany({ where: { requestId, decision: "PENDING" } });
     }
 
+    // Close out the approval instance when the chain has resolved.
+    if (nextStatus === "APPROVED" || nextStatus === "REJECTED" || nextStatus === "RETURNED") {
+      await tx.approvalInstance.updateMany({
+        where: { requestId, status: "IN_PROGRESS" },
+        data: {
+          status:
+            nextStatus === "APPROVED" ? "APPROVED" : nextStatus === "REJECTED" ? "REJECTED" : "RETURNED",
+          completedAt: now,
+          decidedById: ctx.principal.userId,
+          outcomeReason: input.comment || null,
+        },
+      });
+    }
+
+    // Budget movements run inside the same transaction as the decision. §23: an
+    // approval that reserves no money, or a reservation for an approval that
+    // rolled back, are both corruptions of the budget position. A hard-limit
+    // breach therefore blocks the approval rather than being swallowed.
+    if (request.departmentId) {
+      if (nextStatus === "APPROVED") {
+        await budget.reserveForRequest(
+          { organizationId: ctx.principal.organizationId, departmentId: request.departmentId },
+          request.totalEstimated,
+          requestId,
+          ctx.principal.userId,
+          tx
+        );
+      } else if (nextStatus === "REJECTED" || nextStatus === "RETURNED") {
+        await budget.releaseForRequest(
+          { organizationId: ctx.principal.organizationId, departmentId: request.departmentId },
+          requestId,
+          ctx.principal.userId,
+          tx
+        );
+      }
+    }
+
     const updated = await tx.purchaseRequest.update({
       where: { id: requestId },
-      data: { status: nextStatus },
+      data: {
+        status: nextStatus,
+        approvedAt: nextStatus === "APPROVED" ? now : undefined,
+        rejectedAt: nextStatus === "REJECTED" ? now : undefined,
+        rejectionReason: nextStatus === "REJECTED" ? input.comment || null : undefined,
+        returnedAt: nextStatus === "RETURNED" ? now : undefined,
+        returnReason: nextStatus === "RETURNED" ? input.comment || null : undefined,
+      },
       include: requestInclude,
     });
 
     return { updated, state, nextStatus, steps };
   });
-
-  // Budget effects, outside the request transaction so a budget without a matching
-  // department record cannot block a legitimate approval.
-  if (result.nextStatus === "APPROVED" && request.departmentId) {
-    await budget
-      .reserveForRequest(
-        { organizationId: ctx.principal.organizationId, departmentId: request.departmentId },
-        request.totalEstimated,
-        requestId,
-        ctx.principal.userId
-      )
-      .catch((err) => {
-        console.error("[request] budget reservation failed", err);
-      });
-  }
-  if (result.nextStatus === "REJECTED" && request.departmentId) {
-    await budget
-      .releaseForRequest(
-        { organizationId: ctx.principal.organizationId, departmentId: request.departmentId },
-        requestId,
-        ctx.principal.userId
-      )
-      .catch(() => {});
-  }
 
   const verb =
     input.decision === "APPROVED"
@@ -678,9 +765,10 @@ export async function cancel(ctx: ServiceContext, id: string, reason: string) {
   });
   if (!request) throw notFound("Purchase request not found");
 
-  if (request.status === "COMPLETED" || request.status === "CANCELLED") {
+  if (request.status === "CLOSED" || request.status === "CANCELLED") {
     throw conflict(`This request is already ${request.status.toLowerCase()}`);
   }
+  transition("request", request.status, "CANCELLED");
 
   const liveOrders = request.purchaseOrders.filter(
     (po) => !["CANCELLED", "DRAFT"].includes(po.status)
@@ -694,21 +782,26 @@ export async function cancel(ctx: ServiceContext, id: string, reason: string) {
 
   await db.$transaction(async (tx) => {
     await tx.approvalStep.deleteMany({ where: { requestId: id, decision: "PENDING" } });
+    await tx.approvalInstance.updateMany({
+      where: { requestId: id, status: "IN_PROGRESS" },
+      data: { status: "CANCELLED", completedAt: new Date(), outcomeReason: reason },
+    });
     await tx.purchaseRequest.update({
       where: { id },
       data: { status: "CANCELLED", cancelledAt: new Date() },
     });
-  });
 
-  if (request.departmentId) {
-    await budget
-      .releaseForRequest(
+    // Whatever this request was holding goes back to the budget, in the same
+    // transaction that cancelled it.
+    if (request.departmentId) {
+      await budget.releaseForRequest(
         { organizationId: ctx.principal.organizationId, departmentId: request.departmentId },
         id,
-        ctx.principal.userId
-      )
-      .catch(() => {});
-  }
+        ctx.principal.userId,
+        tx
+      );
+    }
+  });
 
   await recordAudit({
     organizationId: ctx.principal.organizationId,
@@ -821,10 +914,15 @@ export async function toggleWatcher(ctx: ServiceContext, requestId: string, user
 }
 
 /**
- * Closes a request once its downstream chain has fully settled.
+ * Moves a request along its fulfilment states from the facts downstream.
  *
- * Called by the PO, receiving and invoice services rather than by a user, so
- * completion reflects reality: every PO closed, every invoice paid.
+ * Called by the PO, receiving, invoice and payment services rather than by a
+ * user, so the status reflects reality rather than intent:
+ *
+ *   ORDERED               a purchase order exists
+ *   PARTIALLY_FULFILLED   some ordered quantity has been received
+ *   FULFILLED             everything ordered has been received or rejected
+ *   CLOSED               ... and every invoice against it has been paid
  */
 export async function reconcileCompletion(organizationId: string, requestId: string) {
   const request = await db.purchaseRequest.findFirst({
@@ -837,27 +935,50 @@ export async function reconcileCompletion(organizationId: string, requestId: str
     },
   });
   if (!request) return;
-  if (request.status === "CANCELLED" || request.status === "COMPLETED") return;
+  if (request.status === "CANCELLED" || request.status === "CLOSED") return;
   if (request.purchaseOrders.length === 0) return;
 
-  const allReceived = request.purchaseOrders.every((po) =>
-    po.lineItems.every((li) => li.receivedQty + li.rejectedQty >= li.orderedQty)
-  );
+  const lines = request.purchaseOrders.flatMap((po) => po.lineItems);
+  const settled = (li: { receivedQty: number; rejectedQty: number; orderedQty: number }) =>
+    li.receivedQty + li.rejectedQty >= li.orderedQty;
+
+  const allReceived = lines.length > 0 && lines.every(settled);
+  const someReceived = lines.some((li) => li.receivedQty > 0);
   const allInvoicesPaid = request.purchaseOrders.every(
     (po) => po.invoices.length > 0 && po.invoices.every((inv) => inv.status === "PAID")
   );
 
-  if (allReceived && allInvoicesPaid) {
-    await db.purchaseRequest.update({
-      where: { id: requestId },
-      data: { status: "COMPLETED", completedAt: new Date() },
-    });
-    await recordActivity({
-      organizationId,
-      eventType: "REQUEST_COMPLETED",
-      description: `${request.requestNumber} completed — all goods received and invoices settled`,
-      severity: "SUCCESS",
-      requestId,
-    });
-  }
+  const target: RequestStatus =
+    allReceived && allInvoicesPaid
+      ? "CLOSED"
+      : allReceived
+        ? "FULFILLED"
+        : someReceived
+          ? "PARTIALLY_FULFILLED"
+          : "ORDERED";
+
+  if (target === request.status) return;
+  if (!canTransition("request", request.status, target)) return;
+
+  const now = new Date();
+  await db.purchaseRequest.update({
+    where: { id: requestId },
+    data: {
+      status: target,
+      orderedAt: target === "ORDERED" ? (request.orderedAt ?? now) : undefined,
+      fulfilledAt: target === "FULFILLED" || target === "CLOSED" ? (request.fulfilledAt ?? now) : undefined,
+      closedAt: target === "CLOSED" ? now : undefined,
+    },
+  });
+
+  await recordActivity({
+    organizationId,
+    eventType: target === "CLOSED" ? "REQUEST_COMPLETED" : "STATUS_CHANGE",
+    description:
+      target === "CLOSED"
+        ? `${request.requestNumber} closed — all goods received and invoices settled`
+        : `${request.requestNumber} is now ${target.toLowerCase().replace(/_/g, " ")}`,
+    severity: target === "CLOSED" ? "SUCCESS" : "INFO",
+    requestId,
+  });
 }

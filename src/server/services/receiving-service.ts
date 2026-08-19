@@ -124,7 +124,7 @@ export async function outstandingForPo(ctx: ServiceContext, purchaseOrderId: str
 // ---------------------------------------------------------------------------
 
 export async function create(ctx: ServiceContext, input: CreateInput) {
-  await assertPermission(ctx.principal, "purchaseOrders.updateStatus");
+  await assertPermission(ctx.principal, "goodsReceipts.create");
   const organizationId = ctx.principal.organizationId;
   const tdb = scoped(ctx);
 
@@ -167,6 +167,15 @@ export async function create(ctx: ServiceContext, input: CreateInput) {
     }
   }
 
+  for (const item of input.items) {
+    if (item.damagedQty > item.rejectedQty + item.receivedQty + 0.0001) {
+      throw validation(
+        "Damaged quantity cannot exceed what was delivered on that line",
+        { poLineItemId: item.poLineItemId }
+      );
+    }
+  }
+
   const active = input.items.filter((i) => i.receivedQty > 0 || i.rejectedQty > 0);
   if (active.length === 0) {
     throw validation("Record a received or rejected quantity on at least one line");
@@ -189,6 +198,9 @@ export async function create(ctx: ServiceContext, input: CreateInput) {
         status: "DRAFT",
         receivedDate,
         location: input.location || null,
+        warehouseId: input.warehouseId ?? null,
+        carrier: input.carrier || null,
+        waybillNumber: input.waybillNumber || null,
         deliveryNoteRef: input.deliveryNoteRef || null,
         notes: input.notes || null,
         items: {
@@ -198,10 +210,19 @@ export async function create(ctx: ServiceContext, input: CreateInput) {
               poLineItemId: line.id,
               itemName: line.itemName,
               orderedQty: line.orderedQty,
+              // What the driver handed over, and what happened to it. Keeping all
+              // four apart is what makes "ordered ≠ delivered ≠ accepted" answerable
+              // instead of collapsing into a single number.
+              deliveredQty: item.receivedQty + item.rejectedQty,
               receivedQty: item.receivedQty,
               rejectedQty: item.rejectedQty,
+              damagedQty: item.damagedQty,
               unit: line.unit,
               condition: item.condition,
+              warehouseId: item.warehouseId ?? input.warehouseId ?? null,
+              batchNumber: item.batchNumber ?? null,
+              expiryDate: item.expiryDate ? new Date(item.expiryDate) : null,
+              serialNumbers: item.serialNumbers ?? undefined,
               notes: item.notes || null,
             };
           }),
@@ -239,7 +260,7 @@ export async function create(ctx: ServiceContext, input: CreateInput) {
  * committed — and so posting is idempotent-guarded by the `postedAt` timestamp.
  */
 export async function post(ctx: ServiceContext, receiptId: string) {
-  await assertPermission(ctx.principal, "purchaseOrders.updateStatus");
+  await assertPermission(ctx.principal, "goodsReceipts.post");
   const organizationId = ctx.principal.organizationId;
   const tdb = scoped(ctx);
 
@@ -296,6 +317,13 @@ export async function post(ctx: ServiceContext, receiptId: string) {
         const invItem = await tx.inventoryItem.findUnique({ where: { id: fresh.inventoryItemId } });
         if (invItem) {
           const balanceAfter = invItem.quantity + item.receivedQty;
+          const warehouseId =
+            item.warehouseId ??
+            receipt.warehouseId ??
+            fresh.warehouseId ??
+            invItem.defaultWarehouseId ??
+            null;
+
           await tx.stockMovement.create({
             data: {
               itemId: invItem.id,
@@ -306,11 +334,33 @@ export async function post(ctx: ServiceContext, receiptId: string) {
               reference: receipt.receiptNumber,
               purchaseOrderId: po.id,
               goodsReceiptId: receipt.id,
+              goodsReceiptItemId: item.id,
+              warehouseId,
+              toWarehouseId: warehouseId,
               toLocation: receipt.location ?? invItem.location,
               notes: `Received against ${po.poNumber}`,
               performedById: ctx.principal.userId,
             },
           });
+
+          // Stock lives somewhere. The per-warehouse balance is updated in the
+          // same transaction as the item total, so "we hold 40" and "we hold 40
+          // in Lagos" can never disagree.
+          if (warehouseId) {
+            const existing = await tx.stockBalance.findUnique({
+              where: { itemId_warehouseId: { itemId: invItem.id, warehouseId } },
+            });
+            if (existing) {
+              await tx.stockBalance.update({
+                where: { id: existing.id },
+                data: { quantity: { increment: item.receivedQty } },
+              });
+            } else {
+              await tx.stockBalance.create({
+                data: { itemId: invItem.id, warehouseId, quantity: item.receivedQty },
+              });
+            }
+          }
           await tx.inventoryItem.update({
             where: { id: invItem.id },
             data: {
@@ -343,8 +393,11 @@ export async function post(ctx: ServiceContext, receiptId: string) {
                 (fresh.assetCategory as Prisma.AssetCreateInput["category"]) ?? "OTHER",
               purchaseOrderId: po.id,
               goodsReceiptId: receipt.id,
+              goodsReceiptItemId: item.id,
+              poLineItemId: fresh.id,
               vendorId: po.vendorId,
-              departmentId: po.request?.departmentId ?? null,
+              departmentId: po.request?.departmentId ?? po.departmentId ?? null,
+              branchId: null,
               location: receipt.location ?? null,
               status: "IN_STORAGE",
               purchaseDate: receipt.receivedDate,

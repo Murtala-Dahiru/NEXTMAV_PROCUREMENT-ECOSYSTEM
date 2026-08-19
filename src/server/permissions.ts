@@ -6,9 +6,19 @@
 // explicit, commented decision that no permission gate applies.
 //
 // Resolution order for a user's effective permissions:
-//   1. per-user `customPermissions` (a full replacement, if set)
-//   2. per-organization `RolePermissionOverride` for the role (a full replacement)
-//   3. the built-in `ROLE_PERMISSIONS` default for the role
+//
+//   1. per-user `customPermissions` — a full replacement, if set
+//   2. the union of the permissions granted by every role the user holds
+//      (`UserRoleAssignment` → `Role` → `RolePermission`), which is the
+//      configurable path an organization actually administers
+//   3. the `Role` row matching the user's legacy `role` enum value, for accounts
+//      created before any role was assigned to them
+//   4. the built-in `ROLE_PERMISSIONS` default for that enum value, so a database
+//      with no roles installed still authorises correctly rather than locking
+//      everybody out
+//
+// Steps 3 and 4 are bootstrap paths, not a second configuration surface: as soon
+// as a user holds a role, the database is the only thing consulted.
 
 import type { UserRole } from "@prisma/client";
 import { ROLE_PERMISSIONS, type Permission } from "@/lib/types";
@@ -18,56 +28,77 @@ import type { InternalPrincipal } from "./session";
 
 export type { Permission };
 
-/** Per-request memo so a handler touching several gates issues one override query. */
-type OverrideCache = Map<string, Permission[] | null>;
-const overrideCaches = new WeakMap<object, OverrideCache>();
+/** Per-request memo so a handler touching several gates issues one query. */
+type PermissionCache = Map<string, Permission[]>;
+const caches = new WeakMap<object, PermissionCache>();
 
-function cacheFor(principal: InternalPrincipal): OverrideCache {
-  let c = overrideCaches.get(principal);
+function cacheFor(principal: InternalPrincipal): PermissionCache {
+  let c = caches.get(principal);
   if (!c) {
     c = new Map();
-    overrideCaches.set(principal, c);
+    caches.set(principal, c);
   }
   return c;
 }
 
-async function roleOverride(
+/** Permissions granted by the roles the user currently holds. */
+async function permissionsFromAssignedRoles(
   principal: InternalPrincipal
 ): Promise<Permission[] | null> {
-  const cache = cacheFor(principal);
-  const key = `${principal.organizationId}:${principal.role}`;
-  if (cache.has(key)) return cache.get(key) ?? null;
-
-  const row = await db.rolePermissionOverride.findUnique({
+  const now = new Date();
+  const assignments = await db.userRoleAssignment.findMany({
     where: {
-      organizationId_role: {
-        organizationId: principal.organizationId,
-        role: principal.role,
-      },
+      userId: principal.userId,
+      organizationId: principal.organizationId,
+      role: { isActive: true },
+      OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
     },
+    select: { role: { select: { permissions: { select: { permission: true } } } } },
   });
 
-  let result: Permission[] | null = null;
-  if (row) {
-    try {
-      const parsed = JSON.parse(row.permissions);
-      if (Array.isArray(parsed)) result = parsed as Permission[];
-    } catch {
-      result = null;
-    }
-  }
+  if (assignments.length === 0) return null;
 
-  cache.set(key, result);
-  return result;
+  const held = new Set<string>();
+  for (const a of assignments) {
+    for (const p of a.role.permissions) held.add(p.permission);
+  }
+  return [...held] as Permission[];
+}
+
+/** Permissions of the Role row that corresponds to the user's legacy enum role. */
+async function permissionsFromLegacyRole(
+  principal: InternalPrincipal
+): Promise<Permission[] | null> {
+  const role = await db.role.findFirst({
+    where: {
+      organizationId: principal.organizationId,
+      legacyRole: principal.role,
+      isActive: true,
+    },
+    select: { permissions: { select: { permission: true } } },
+  });
+  if (!role) return null;
+  return role.permissions.map((p) => p.permission) as Permission[];
 }
 
 export async function effectivePermissions(
   principal: InternalPrincipal
 ): Promise<Permission[]> {
   if (principal.customPermissions) return principal.customPermissions as Permission[];
-  const override = await roleOverride(principal);
-  if (override) return override;
-  return ROLE_PERMISSIONS[principal.role as UserRole] ?? [];
+
+  const cache = cacheFor(principal);
+  const key = `${principal.organizationId}:${principal.userId}`;
+  const cached = cache.get(key);
+  if (cached) return cached;
+
+  const resolved =
+    (await permissionsFromAssignedRoles(principal)) ??
+    (await permissionsFromLegacyRole(principal)) ??
+    ROLE_PERMISSIONS[principal.role as UserRole] ??
+    [];
+
+  cache.set(key, resolved);
+  return resolved;
 }
 
 export async function can(

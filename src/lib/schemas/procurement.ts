@@ -100,6 +100,16 @@ export const rfqLineItemSchema = z.object({
   unit: z.string().trim().min(1).max(40).default("unit"),
 });
 
+export const rfqCriterionSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  type: z
+    .enum(["PRICE", "DELIVERY", "QUALITY", "COMPLIANCE", "WARRANTY", "EXPERIENCE", "OTHER"])
+    .default("OTHER"),
+  weight: z.number().min(0).max(100).default(1),
+  lowerIsBetter: z.boolean().default(false),
+  maxScore: z.number().min(1).max(100).default(10),
+});
+
 export const createRfqSchema = z.object({
   title: z.string().trim().min(3).max(200),
   description: z.string().trim().max(5000).optional().default(""),
@@ -109,6 +119,9 @@ export const createRfqSchema = z.object({
   // Optional: when an RFQ is raised from an approved request, the lines are
   // derived from that request rather than re-keyed.
   lineItems: z.array(rfqLineItemSchema).max(200).optional(),
+  // Defined before bids arrive, so the yardstick cannot be chosen after seeing
+  // the numbers.
+  criteria: z.array(rfqCriterionSchema).max(20).optional(),
 });
 
 export const quotationLineItemSchema = z.object({
@@ -133,6 +146,18 @@ export const submitQuotationSchema = z.object({
 export const evaluateQuotationSchema = z.object({
   evaluationScore: z.number().min(0).max(100),
   evaluationNotes: z.string().trim().max(2000).optional().default(""),
+  // Per-criterion scoring. The weighted total is derived from these, never sent
+  // by the client — a caller cannot assert the score that wins the award.
+  criterionScores: z
+    .array(
+      z.object({
+        criterionId: z.string().min(1),
+        score: z.number().min(0).max(100),
+        notes: z.string().trim().max(1000).optional(),
+      })
+    )
+    .max(20)
+    .optional(),
 });
 
 export const awardRfqSchema = z.object({
@@ -193,14 +218,25 @@ export const cancelSchema = z.object({
 
 export const receiptItemSchema = z.object({
   poLineItemId: z.string().min(1),
+  /** Accepted into stock. */
   receivedQty: z.number().finite().min(0),
+  /** Turned away — counts as settled against the order, never enters stock. */
   rejectedQty: z.number().finite().min(0).default(0),
+  /** Arrived broken. A subset of what was rejected, kept for supplier quality. */
+  damagedQty: z.number().finite().min(0).default(0),
   condition: z.enum(["GOOD", "DAMAGED", "MISSING"]).default("GOOD"),
+  warehouseId: z.string().optional(),
+  batchNumber: z.string().trim().max(80).optional(),
+  expiryDate: z.string().datetime({ offset: true }).or(z.string().date()).optional(),
+  serialNumbers: z.array(z.string().trim().max(120)).max(500).optional(),
   notes: z.string().trim().max(1000).optional(),
 });
 
 export const createReceiptSchema = z.object({
   purchaseOrderId: z.string().min(1),
+  warehouseId: z.string().optional(),
+  carrier: z.string().trim().max(120).optional(),
+  waybillNumber: z.string().trim().max(120).optional(),
   receivedDate: z.string().datetime({ offset: true }).or(z.string().date()).optional(),
   location: z.string().trim().max(200).optional(),
   deliveryNoteRef: z.string().trim().max(120).optional(),

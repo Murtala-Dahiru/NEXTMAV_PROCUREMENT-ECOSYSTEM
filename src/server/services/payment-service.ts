@@ -22,7 +22,9 @@ import { assertPermission } from "../permissions";
 import { recordActivity, recordAudit } from "../audit";
 import { nextDocumentNumber, PREFIX } from "../numbering";
 import { emit } from "../engines/events";
+import * as budgetEngine from "../engines/budget";
 import * as invoiceService from "./invoice-service";
+import { transition } from "../state-machine";
 import { orderBy, paginate, scoped, type Page, type ServiceContext } from "./context";
 import type {
   createPaymentSchema,
@@ -127,7 +129,7 @@ export async function getById(ctx: ServiceContext, id: string) {
 // ---------------------------------------------------------------------------
 
 export async function create(ctx: ServiceContext, input: CreateInput) {
-  await assertPermission(ctx.principal, "budgets.manage");
+  await assertPermission(ctx.principal, "payments.create");
   const organizationId = ctx.principal.organizationId;
   const tdb = scoped(ctx);
 
@@ -162,6 +164,9 @@ export async function create(ctx: ServiceContext, input: CreateInput) {
 
   const payment = await db.$transaction(async (tx) => {
     const paymentNumber = await nextDocumentNumber(organizationId, PREFIX.payment, { client: tx });
+    // The allocation is what the invoice balance is derived from. Creating it
+    // alongside the payment means a consolidated payment across several invoices
+    // is a matter of adding rows, not of reinterpreting a single invoiceId.
     return tx.payment.create({
       data: {
         organizationId,
@@ -178,6 +183,17 @@ export async function create(ctx: ServiceContext, input: CreateInput) {
         reference: input.reference || null,
         notes: input.notes || null,
         processedById: ctx.principal.userId,
+        allocations: {
+          create: [
+            {
+              organizationId,
+              invoiceId: invoice.id,
+              vendorId: invoice.vendorId,
+              amount: input.amount,
+              currency: invoice.currency,
+            },
+          ],
+        },
       },
       include: paymentInclude,
     });
@@ -227,7 +243,7 @@ export async function create(ctx: ServiceContext, input: CreateInput) {
  * rather than by convention.
  */
 export async function approve(ctx: ServiceContext, id: string) {
-  await assertPermission(ctx.principal, "budgets.manage");
+  await assertPermission(ctx.principal, "payments.approve");
   const tdb = scoped(ctx);
 
   const payment = await tdb.payment.findUnique({ where: { id }, include: paymentInclude });
@@ -283,7 +299,7 @@ export async function approve(ctx: ServiceContext, id: string) {
  * called — and only then does the platform actually move money.
  */
 export async function process(ctx: ServiceContext, id: string) {
-  await assertPermission(ctx.principal, "budgets.manage");
+  await assertPermission(ctx.principal, "payments.process");
   const tdb = scoped(ctx);
 
   const payment = await tdb.payment.findUnique({ where: { id }, include: paymentInclude });
@@ -337,7 +353,7 @@ export async function process(ctx: ServiceContext, id: string) {
 
 /** Records the real-world outcome and settles the invoice position. */
 export async function settle(ctx: ServiceContext, id: string, input: SettleInput) {
-  await assertPermission(ctx.principal, "budgets.manage");
+  await assertPermission(ctx.principal, "payments.process");
   const organizationId = ctx.principal.organizationId;
   const tdb = scoped(ctx);
 
@@ -354,16 +370,72 @@ export async function settle(ctx: ServiceContext, id: string, input: SettleInput
     throw validation("A failure reason is required when recording a failed payment");
   }
 
-  await tdb.payment.update({
-    where: { id },
-    data: {
-      status: completed ? "COMPLETED" : "FAILED",
-      paymentDate: completed ? (input.paymentDate ? new Date(input.paymentDate) : new Date()) : null,
-      reference: input.reference ?? payment.reference,
-      failureReason: completed ? null : input.failureReason,
-      reconciledAt: completed ? new Date() : null,
-      reconciledById: completed ? ctx.principal.userId : null,
+  // Which department's budget this payment draws on. Resolved through the
+  // invoice's order rather than assumed, because a payment can only be charged
+  // where the spend was approved.
+  const coding = await db.invoice.findFirst({
+    where: { id: payment.invoiceId, organizationId },
+    select: {
+      purchaseOrder: {
+        select: { departmentId: true, request: { select: { departmentId: true } } },
+      },
     },
+  });
+  const departmentId =
+    coding?.purchaseOrder?.request?.departmentId ?? coding?.purchaseOrder?.departmentId ?? null;
+
+  const nextStatus = transition("payment", payment.status, completed ? "COMPLETED" : "FAILED");
+  const paidAt = completed
+    ? input.paymentDate
+      ? new Date(input.paymentDate)
+      : new Date()
+    : null;
+
+  await db.$transaction(async (tx) => {
+    await tx.payment.update({
+      where: { id },
+      data: {
+        status: nextStatus,
+        paymentDate: paidAt,
+        reference: input.reference ?? payment.reference,
+        failureReason: completed ? null : input.failureReason,
+        reconciledAt: completed ? new Date() : null,
+        reconciledById: completed ? ctx.principal.userId : null,
+        reconciledAmount: completed ? payment.amount : null,
+        reconciliationRef: completed ? (input.reference ?? payment.reference) : null,
+      },
+    });
+
+    // Every attempt is written down, successful or not, so a payment that failed
+    // twice before clearing keeps that history against the same record.
+    const attempts = await tx.paymentTransaction.count({ where: { paymentId: id } });
+    await tx.paymentTransaction.create({
+      data: {
+        paymentId: id,
+        attempt: attempts + 1,
+        status: nextStatus,
+        provider: payment.providerName,
+        providerRef: payment.providerRef,
+        amount: payment.amount,
+        currency: payment.currency,
+        errorMessage: completed ? null : (input.failureReason ?? null),
+        occurredAt: paidAt ?? new Date(),
+      },
+    });
+
+    // Cash out is the last link in the budget chain.
+    if (completed) {
+      if (departmentId) {
+        await budgetEngine.recordPayment(
+          { organizationId, departmentId },
+          payment.amount,
+          payment.id,
+          payment.invoiceId,
+          ctx.principal.userId,
+          tx
+        );
+      }
+    }
   });
 
   // Only a completed payment changes what the invoice still owes.
@@ -427,7 +499,7 @@ export async function settle(ctx: ServiceContext, id: string, input: SettleInput
 }
 
 export async function cancel(ctx: ServiceContext, id: string, reason: string) {
-  await assertPermission(ctx.principal, "budgets.manage");
+  await assertPermission(ctx.principal, "payments.process");
   const tdb = scoped(ctx);
 
   const payment = await tdb.payment.findUnique({ where: { id } });

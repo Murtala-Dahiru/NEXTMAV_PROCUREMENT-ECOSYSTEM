@@ -1,12 +1,29 @@
 // NextMav Procure — Prisma Schema
 // Canonical persistence model for the multi-tenant Procure-to-Pay platform.
+// Supabase PostgreSQL 17. See docs/DATA_ARCHITECTURE.md for the whole picture.
 //
-// Tenancy rule: every tenant-scoped table carries `organizationId` and is indexed on it.
-// All access must go through the org-scoped query guard in `src/server/tenancy.ts`;
-// never query these models directly from a route handler.
+// Tenancy rule: every tenant-scoped table carries `organizationId` and is indexed
+// on it. All access goes through the org-scoped query guard in
+// `src/server/tenancy.ts`, which injects the filter into every operation on all 43
+// tenant-scoped models — including findUnique, update and delete by primary key.
+// Never query these models directly from a route handler.
+//
+// Money rule: every monetary and quantity column is `numeric(18,4)` (rates 9,4), so
+// Postgres aggregates them exactly. Prisma returns those as Decimal; the generated
+// extension in `src/server/decimal-fields.ts` converts them to `number` on read, so
+// application code works in plain numbers. Aggregates (`_sum`) stay Decimal on
+// purpose — the compiler then flags every place a total is computed.
+//
+// Lifecycle rule: no service assigns `status` directly. Every transition goes
+// through `src/server/state-machine.ts`, which is the authoritative definition of
+// each document lifecycle; the diagrams in the comments below describe those tables.
 //
 // Numbering rule: human-facing document numbers (REQ-, RFQ-, PO-, GRN-, INV-, PAY-, CTR-)
 // are unique *within* an organization, not globally — see the @@unique([organizationId, …]).
+//
+// Supabase rule: any migration that adds a table must be followed by
+// `npm run db:harden`. Supabase publishes the `public` schema through PostgREST, so
+// a table without row-level security is readable by anyone holding the browser key.
 
 generator client {
   provider = "prisma-client-js"
@@ -30,69 +47,95 @@ datasource db {
 // ===========================================================================
 
 model Organization {
-  id            String   @id @default(cuid())
-  name          String
-  legalName     String?
-  industry      String?
-  country       String?
-  currency      String   @default("USD")
-  taxId         String?
-  logoUrl       String?
-  address       String?
-  phone         String?
-  website       String?
-  fiscalYearStartMonth Int @default(1)
+  id                   String             @id @default(cuid())
+  name                 String
+  legalName            String?
+  industry             String?
+  country              String?
+  currency             String             @default("USD")
+  taxId                String?
+  logoUrl              String?
+  address              String?
+  phone                String?
+  website              String?
+  fiscalYearStartMonth Int                @default(1)
+  timezone             String             @default("UTC")
+  status               OrganizationStatus @default(ACTIVE)
+  // Tenant-level configuration (approval defaults, tolerances, numbering options).
+  // Structured server-managed document — jsonb, not a stringified blob.
+  settings             Json?
 
   // Branding (was BrandingConfig in types.ts)
-  brandPrimaryColor   String?
-  brandAccentColor    String?
-  brandLogoUrl        String?
+  brandPrimaryColor String?
+  brandAccentColor  String?
+  brandLogoUrl      String?
 
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  branches         Branch[]
-  departments      Department[]
-  users            User[]
-  vendors          Vendor[]
-  requests         PurchaseRequest[]
-  templates        RequestTemplate[]
-  recurringRequests RecurringRequest[]
-  rfqs             RFQ[]
-  purchaseOrders   PurchaseOrder[]
-  goodsReceipts    GoodsReceipt[]
-  invoices         Invoice[]
-  payments         Payment[]
-  contracts        Contract[]
-  assets           Asset[]
-  inventoryItems   InventoryItem[]
-  documents        DocumentRecord[]
-  budgets          Budget[]
-  workflows        ApprovalWorkflow[]
-  integrations     Integration[]
-  activities       ActivityLog[]
-  auditLogs        AuditLogEntry[]
-  notifications    Notification[]
-  savedViews       SavedView[]
-  rolePermissions  RolePermissionOverride[]
-  signatures       DigitalSignature[]
-  supplierUsers    SupplierUser[]
+  branches            Branch[]
+  departments         Department[]
+  users               User[]
+  vendors             Vendor[]
+  requests            PurchaseRequest[]
+  templates           RequestTemplate[]
+  recurringRequests   RecurringRequest[]
+  rfqs                RFQ[]
+  purchaseOrders      PurchaseOrder[]
+  goodsReceipts       GoodsReceipt[]
+  invoices            Invoice[]
+  payments            Payment[]
+  contracts           Contract[]
+  assets              Asset[]
+  inventoryItems      InventoryItem[]
+  documents           DocumentRecord[]
+  budgets             Budget[]
+  workflows           ApprovalWorkflow[]
+  integrations        Integration[]
+  activities          ActivityLog[]
+  auditLogs           AuditLogEntry[]
+  notifications       Notification[]
+  savedViews          SavedView[]
+  signatures          DigitalSignature[]
+  supplierUsers       SupplierUser[]
+  costCenters         CostCenter[]
+  roles               Role[]
+  roleAssignments     UserRoleAssignment[]
+  categories          ProcurementCategory[]
+  warehouses          Warehouse[]
+  approvalInstances   ApprovalInstance[]
+  approvalDelegations ApprovalDelegation[]
+  quotations          Quotation[]
+  rfqAwards           RFQAward[]
+  paymentAllocations  PaymentAllocation[]
+  invoiceExceptions   InvoiceMatchException[]
+  documentLinks       DocumentLink[]
+  storedFiles         StoredFile[]
+  outboxEvents        EventOutbox[]
+  vendorCategories    VendorCategoryLink[]
 }
 
+// A physical location: office, plant, site. Warehouses and assets hang off it.
 model Branch {
   id             String   @id @default(cuid())
   organizationId String
+  code           String?
   name           String
   address        String?
   city           String?
   country        String?
+  timezone       String?
+  isActive       Boolean  @default(true)
   createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now()) @updatedAt
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   departments  Department[]
   users        User[]
   assets       Asset[]
+  warehouses   Warehouse[]
 
+  @@unique([organizationId, code])
   @@index([organizationId])
 }
 
@@ -100,21 +143,73 @@ model Department {
   id             String   @id @default(cuid())
   organizationId String
   branchId       String?
+  // Departments nest: "Engineering" → "Platform". Approval routing and budget
+  // rollups both walk this hierarchy.
+  parentId       String?
+  costCenterId   String?
   name           String
   code           String?
   managerId      String?
+  isActive       Boolean  @default(true)
   createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now()) @updatedAt
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  branch       Branch?      @relation(fields: [branchId], references: [id])
-  users        User[]
-  requests     PurchaseRequest[]
-  budgets      Budget[]
-  templates    RequestTemplate[]
-  assets       Asset[]
+  branch       Branch?      @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  parent       Department?  @relation("DepartmentTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children     Department[] @relation("DepartmentTree")
+  costCenter   CostCenter?  @relation(fields: [costCenterId], references: [id], onDelete: SetNull)
+  manager      User?        @relation("DepartmentManager", fields: [managerId], references: [id], onDelete: SetNull)
 
+  users          User[]
+  requests       PurchaseRequest[]
+  budgets        Budget[]
+  templates      RequestTemplate[]
+  assets         Asset[]
+  purchaseOrders PurchaseOrder[]
+  contracts      Contract[]
+
+  @@unique([organizationId, code])
   @@index([organizationId])
   @@index([branchId])
+  @@index([parentId])
+  @@index([costCenterId])
+  @@index([managerId])
+}
+
+// Where spend is charged. A cost centre is the finance-side counterpart of a
+// department: budgets, requests, POs and invoices all carry one so that spend
+// can be reported along the finance hierarchy rather than the org chart.
+model CostCenter {
+  id             String   @id @default(cuid())
+  organizationId String
+  code           String
+  name           String
+  description    String?
+  ownerId        String?
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now()) @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  owner        User?        @relation("CostCenterOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+
+  departments    Department[]
+  users          User[]
+  budgets        Budget[]
+  requests       PurchaseRequest[]
+  purchaseOrders PurchaseOrder[]
+  invoices       Invoice[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+  @@index([ownerId])
+}
+
+enum OrganizationStatus {
+  ACTIVE
+  SUSPENDED
+  CLOSED
 }
 
 // ===========================================================================
@@ -138,56 +233,81 @@ enum UserStatus {
 }
 
 model User {
-  id             String     @id @default(cuid())
-  organizationId String
-  branchId       String?
-  departmentId   String?
-  email          String
-  name           String
-  role           UserRole   @default(EMPLOYEE)
-  status         UserStatus @default(ACTIVE)
-  jobTitle       String?
-  phone          String?
-  avatarColor    String     @default("bg-emerald-500")
-  initials       String     @default("")
-  passwordHash   String?
-  mfaEnabled     Boolean    @default(false)
-  mfaSecret      String?
-  lastLoginAt    DateTime?
+  id                String     @id @default(cuid())
+  organizationId    String
+  branchId          String?
+  departmentId      String?
+  email             String
+  name              String
+  role              UserRole   @default(EMPLOYEE)
+  status            UserStatus @default(ACTIVE)
+  jobTitle          String?
+  phone             String?
+  avatarColor       String     @default("bg-emerald-500")
+  initials          String     @default("")
+  passwordHash      String?
+  mfaEnabled        Boolean    @default(false)
+  mfaSecret         String?
+  lastLoginAt       DateTime?
   // Per-user permission grants layered over the role defaults. JSON array of Permission literals.
   customPermissions String?
-  createdAt      DateTime   @default(now())
-  updatedAt      DateTime   @updatedAt
+  employeeNumber    String?
+  costCenterId      String?
+  managerId         String?
+  timezone          String?
+  locale            String?
+  deactivatedAt     DateTime?
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  branch       Branch?      @relation(fields: [branchId], references: [id])
-  department   Department?  @relation(fields: [departmentId], references: [id])
+  branch       Branch?      @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  department   Department?  @relation(fields: [departmentId], references: [id], onDelete: SetNull)
 
-  sessions          Session[]
-  requests          PurchaseRequest[] @relation("RequestRequester")
-  approvals         ApprovalStep[]    @relation("ApprovalApprover")
-  delegatedApprovals ApprovalStep[]   @relation("ApprovalDelegate")
-  comments          Comment[]
-  watching          RequestWatcher[]
-  activities        ActivityLog[]
-  auditLogs         AuditLogEntry[]
-  notifications     Notification[]
+  sessions               Session[]
+  costCenter             CostCenter?             @relation(fields: [costCenterId], references: [id], onDelete: SetNull)
+  manager                User?                   @relation("UserManager", fields: [managerId], references: [id], onDelete: SetNull)
+  directReports          User[]                  @relation("UserManager")
+  requests               PurchaseRequest[]       @relation("RequestRequester")
+  approvals              ApprovalStep[]          @relation("ApprovalApprover")
+  delegatedApprovals     ApprovalStep[]          @relation("ApprovalDelegate")
+  comments               Comment[]
+  watching               RequestWatcher[]
+  activities             ActivityLog[]
+  auditLogs              AuditLogEntry[]
+  notifications          Notification[]
   notificationPreference NotificationPreference?
-  savedViews        SavedView[]
-  goodsReceipts     GoodsReceipt[]
-  approvedInvoices  Invoice[]         @relation("InvoiceApprover")
-  processedPayments Payment[]
-  assignedAssets    Asset[]           @relation("AssetAssignee")
-  stockMovements    StockMovement[]
-  uploadedDocuments DocumentRecord[]
-  signatures        DigitalSignature[]
-  aiConversations   AIConversation[]
+  savedViews             SavedView[]
+  goodsReceipts          GoodsReceipt[]
+  approvedInvoices       Invoice[]               @relation("InvoiceApprover")
+  processedPayments      Payment[]
+  assignedAssets         Asset[]                 @relation("AssetAssignee")
+  stockMovements         StockMovement[]
+  uploadedDocuments      DocumentRecord[]
+  signatures             DigitalSignature[]
+  aiConversations        AIConversation[]
+  roleAssignments        UserRoleAssignment[]    @relation("RoleAssignmentUser")
+  roleGrantsMade         UserRoleAssignment[]    @relation("RoleAssignmentGrantedBy")
+  managedDepartments     Department[]            @relation("DepartmentManager")
+  ownedCostCenters       CostCenter[]            @relation("CostCenterOwner")
+  delegationsGiven       ApprovalDelegation[]    @relation("DelegationFrom")
+  delegationsReceived    ApprovalDelegation[]    @relation("DelegationTo")
+  quotationScores        QuotationScore[]
+  rfqAwards              RFQAward[]
+  resolvedExceptions     InvoiceMatchException[]
+  documentLinks          DocumentLink[]
+  vendorAssessments      VendorRiskAssessment[]
+  managedWarehouses      Warehouse[]
+  approvalDecisions      ApprovalInstance[]      @relation("ApprovalInstanceDecidedBy")
 
   // Email is unique per tenant, not globally — the same person may exist in two orgs.
   @@unique([organizationId, email])
   @@index([organizationId])
   @@index([departmentId])
   @@index([email])
+  @@index([branchId])
+  @@index([costCenterId])
+  @@index([managerId])
 }
 
 model Session {
@@ -205,18 +325,87 @@ model Session {
 }
 
 // Role → permission overrides configured per organization (settings/roles screen).
-model RolePermissionOverride {
-  id             String   @id @default(cuid())
+// ---------------------------------------------------------------------------
+// AUTHORIZATION — roles and permissions as data, not as code
+// ---------------------------------------------------------------------------
+//
+// The permission *catalog* is a code constant (`Permission` in src/lib/types.ts):
+// it enumerates what the application is able to check, so it can only change when
+// the application changes. Everything else lives here:
+//
+//   Role                 a named bundle of permissions, per organization
+//   RolePermission       which permissions the role grants
+//   UserRoleAssignment   which roles a user holds (a user may hold several)
+//
+// An organization can therefore define "Warehouse Officer" or "Category Buyer"
+// and route approvals to it without a code change. `User.role` remains as the
+// primary role for reporting and as the bootstrap default before any role has
+// been assigned; `Role.legacyRole` ties a role row back to that enum.
+
+model Role {
+  id             String    @id @default(cuid())
   organizationId String
-  role           UserRole
-  // JSON array of Permission literals that fully replaces the role default when present.
-  permissions    String
-  updatedAt      DateTime @updatedAt
+  // Stable machine key, e.g. PROCUREMENT_OFFICER. Unique per organization.
+  key            String
+  name           String
+  description    String?
+  // System roles ship with the platform and cannot be deleted, only re-permissioned.
+  isSystem       Boolean   @default(false)
+  // Seniority, used to resolve escalation targets and to order the roles screen.
+  rank           Int       @default(0)
+  // Maps this role onto the legacy enum where one applies, so workflow stages and
+  // signatures configured against the enum keep resolving.
+  legacyRole     UserRole?
+  isActive       Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @default(now()) @updatedAt
+
+  organization     Organization            @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  permissions      RolePermission[]
+  assignments      UserRoleAssignment[]
+  approverStages   ApprovalWorkflowStage[] @relation("StageApproverRole")
+  escalationStages ApprovalWorkflowStage[] @relation("StageEscalationRole")
+
+  @@unique([organizationId, key])
+  @@index([organizationId])
+  @@index([organizationId, isActive])
+}
+
+model RolePermission {
+  id         String   @id @default(cuid())
+  roleId     String
+  // A literal from the `Permission` catalog. Validated on write against that
+  // catalog, so an unknown permission can never be persisted.
+  permission String
+  createdAt  DateTime @default(now())
+
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permission])
+  @@index([roleId])
+}
+
+model UserRoleAssignment {
+  id             String    @id @default(cuid())
+  organizationId String
+  userId         String
+  roleId         String
+  // Optional scoping: a role held only for one department or cost centre.
+  departmentId   String?
+  grantedById    String?
+  grantedAt      DateTime  @default(now())
+  expiresAt      DateTime?
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation("RoleAssignmentUser", fields: [userId], references: [id], onDelete: Cascade)
+  role         Role         @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  grantedBy    User?        @relation("RoleAssignmentGrantedBy", fields: [grantedById], references: [id], onDelete: SetNull)
 
-  @@unique([organizationId, role])
+  @@unique([userId, roleId, departmentId])
   @@index([organizationId])
+  @@index([userId])
+  @@index([roleId])
+  @@index([grantedById])
 }
 
 // ===========================================================================
@@ -233,18 +422,18 @@ enum SupplierPortalAccess {
 // Deliberately NOT a `User`. Supplier sessions must never carry an internal role,
 // and no internal query may resolve a SupplierUser into the employee identity space.
 model SupplierUser {
-  id             String               @id @default(cuid())
-  organizationId String
-  vendorId       String
-  email          String
-  contactName    String
-  passwordHash   String?
-  accessStatus   SupplierPortalAccess @default(PENDING)
-  inviteToken    String?              @unique
+  id              String               @id @default(cuid())
+  organizationId  String
+  vendorId        String
+  email           String
+  contactName     String
+  passwordHash    String?
+  accessStatus    SupplierPortalAccess @default(PENDING)
+  inviteToken     String?              @unique
   inviteExpiresAt DateTime?
-  lastLoginAt    DateTime?
-  createdAt      DateTime             @default(now())
-  updatedAt      DateTime             @updatedAt
+  lastLoginAt     DateTime?
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
 
   organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   vendor       Vendor            @relation(fields: [vendorId], references: [id], onDelete: Cascade)
@@ -306,59 +495,82 @@ enum VendorStatus {
   PREFERRED
 }
 
+// The vendor master. Every downstream document (RFQ invitation, quotation, PO,
+// receipt, invoice, payment, contract) points back here rather than carrying its
+// own copy of the supplier's details.
 model Vendor {
-  id             String       @id @default(cuid())
-  organizationId String
-  companyName    String
-  contactPerson  String?
-  email          String?
-  phone          String?
-  address        String?
-  category       String?
-  taxNumber      String?
-  bankName       String?
-  bankAccount    String?
-  paymentTerms   String       @default("NET_30")
-  preferredCurrency String    @default("USD")
-  status         VendorStatus @default(PROSPECTIVE)
+  id                 String       @id @default(cuid())
+  organizationId     String
+  companyName        String
+  contactPerson      String?
+  email              String?
+  phone              String?
+  address            String?
+  category           String?
+  taxNumber          String?
+  bankName           String?
+  bankAccount        String?
+  paymentTerms       String       @default("NET_30")
+  preferredCurrency  String       @default("USD")
+  status             VendorStatus @default(PROSPECTIVE)
+  // Human-facing supplier code, unique per organization.
+  code               String?
+  registrationNumber String?
+  website            String?
+  leadTimeDays       Int?         @default(0)
+  onboardedAt        DateTime?
 
   // Manual/qualitative rating (0-5). Distinct from the derived performance figures below.
-  rating         Float        @default(0)
-  notes          String?
+  rating Float   @default(0)
+  notes  String?
   // JSON string array.
-  tags           String?
+  tags   String?
 
   // --- Derived performance. Recomputed by the scorecard service from receipts,
   // --- invoices and payments; never written directly by a UI mutation.
-  totalOrders          Int      @default(0)
-  totalValue           Float    @default(0)
-  complianceScore      Float    @default(0)
-  onTimeDeliveryRate   Float    @default(0)
-  qualityRating        Float    @default(0)
+  totalOrders          Int       @default(0)
+  totalValue           Decimal   @default(0) @db.Decimal(18, 4)
+  complianceScore      Float     @default(0)
+  onTimeDeliveryRate   Float     @default(0)
+  qualityRating        Float     @default(0)
   performanceUpdatedAt DateTime?
 
-  suspendedAt    DateTime?
-  suspendedReason String?
-  blacklistedAt  DateTime?
+  // --- Risk. `riskScore` is the latest VendorRiskAssessment's score; the
+  // --- assessments themselves are kept as history.
+  riskLevel      VendorRiskLevel @default(UNRATED)
+  riskScore      Float?
+  riskReviewedAt DateTime?
+
+  suspendedAt       DateTime?
+  suspendedReason   String?
+  blacklistedAt     DateTime?
   blacklistedReason String?
 
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  documents      VendorDocument[]
-  rfqInvitations RFQVendor[]
-  quotations     Quotation[]
-  purchaseOrders PurchaseOrder[]
-  goodsReceipts  GoodsReceipt[]
-  invoices       Invoice[]
-  payments       Payment[]
-  contracts      Contract[]
-  assets         Asset[]
-  inventoryItems InventoryItem[]
-  portalUsers    SupplierUser[]
-  activities     SupplierActivity[]
+  organization         Organization                @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  documents            VendorDocument[]
+  rfqInvitations       RFQVendor[]
+  quotations           Quotation[]
+  purchaseOrders       PurchaseOrder[]
+  goodsReceipts        GoodsReceipt[]
+  invoices             Invoice[]
+  payments             Payment[]
+  contracts            Contract[]
+  assets               Asset[]
+  inventoryItems       InventoryItem[]
+  portalUsers          SupplierUser[]
+  activities           SupplierActivity[]
+  contacts             VendorContact[]
+  categoryLinks        VendorCategoryLink[]
+  riskAssessments      VendorRiskAssessment[]
+  performanceSnapshots VendorPerformanceSnapshot[]
+  awards               RFQAward[]
+  paymentAllocations   PaymentAllocation[]
 
+  @@unique([organizationId, code])
+  @@index([organizationId, riskLevel])
   @@index([organizationId])
   @@index([organizationId, status])
 }
@@ -380,35 +592,165 @@ enum ComplianceDocStatus {
 }
 
 model VendorDocument {
-  id         String              @id @default(cuid())
-  vendorId   String
-  type       VendorDocumentType
-  name       String
-  status     ComplianceDocStatus @default(PENDING_REVIEW)
-  expiresAt  DateTime?
+  id           String              @id @default(cuid())
+  vendorId     String
+  type         VendorDocumentType
+  name         String
+  status       ComplianceDocStatus @default(PENDING_REVIEW)
+  expiresAt    DateTime?
   // Points at the stored blob; null while metadata-only.
   storedFileId String?
-  uploadedAt DateTime            @default(now())
+  uploadedAt   DateTime            @default(now())
 
-  vendor     Vendor     @relation(fields: [vendorId], references: [id], onDelete: Cascade)
-  storedFile StoredFile? @relation(fields: [storedFileId], references: [id])
+  vendor     Vendor      @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  storedFile StoredFile? @relation(fields: [storedFileId], references: [id], onDelete: SetNull)
 
   @@index([vendorId])
   @@index([expiresAt])
+  @@index([storedFileId])
 }
 
 // ===========================================================================
+enum VendorRiskLevel {
+  UNRATED
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+// Named people at a supplier. Distinct from SupplierUser: a contact is address-book
+// data the buyer maintains; a SupplierUser is a credentialed portal login.
+model VendorContact {
+  id        String   @id @default(cuid())
+  vendorId  String
+  name      String
+  email     String?
+  phone     String?
+  jobTitle  String?
+  isPrimary Boolean  @default(false)
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  vendor Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  @@index([vendorId])
+}
+
+// Spend taxonomy, shared by vendors, requests, RFQs and budgets. Hierarchical so
+// an organization can report on "IT" and drill into "IT / Software".
+model ProcurementCategory {
+  id             String   @id @default(cuid())
+  organizationId String
+  parentId       String?
+  code           String
+  name           String
+  description    String?
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now()) @updatedAt
+
+  organization Organization          @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  parent       ProcurementCategory?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children     ProcurementCategory[] @relation("CategoryTree")
+
+  vendorLinks    VendorCategoryLink[]
+  requests       PurchaseRequest[]
+  rfqs           RFQ[]
+  purchaseOrders PurchaseOrder[]
+  contracts      Contract[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+  @@index([parentId])
+}
+
+// Which categories a supplier is qualified to supply. Sourcing uses this to
+// propose an invitation list for an RFQ instead of asking the buyer to remember.
+model VendorCategoryLink {
+  id             String   @id @default(cuid())
+  organizationId String
+  vendorId       String
+  categoryId     String
+  isPreferred    Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  vendor       Vendor              @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  category     ProcurementCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([vendorId, categoryId])
+  @@index([organizationId])
+  @@index([categoryId])
+}
+
+// Point-in-time risk review. Kept as history so a supplier's risk trajectory is
+// visible and so an award made under an old rating remains explicable.
+model VendorRiskAssessment {
+  id           String          @id @default(cuid())
+  vendorId     String
+  level        VendorRiskLevel
+  score        Float
+  // JSON object of contributing factors: financial, compliance, delivery, concentration.
+  factors      Json?
+  summary      String?
+  assessedById String?
+  assessedAt   DateTime        @default(now())
+  nextReviewAt DateTime?
+
+  vendor     Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  assessedBy User?  @relation(fields: [assessedById], references: [id], onDelete: SetNull)
+
+  @@index([vendorId, assessedAt])
+  @@index([assessedById])
+}
+
+// Derived scorecard for one period. Computed from receipts, invoices and payments —
+// never written by a UI mutation — so vendor performance is evidence, not opinion.
+model VendorPerformanceSnapshot {
+  id              String   @id @default(cuid())
+  vendorId        String
+  periodStart     DateTime
+  periodEnd       DateTime
+  ordersCount     Int      @default(0)
+  receiptsCount   Int      @default(0)
+  onTimeRate      Float    @default(0)
+  qualityRate     Float    @default(0)
+  complianceScore Float    @default(0)
+  disputeCount    Int      @default(0)
+  totalSpend      Decimal  @default(0) @db.Decimal(18, 4)
+  computedAt      DateTime @default(now())
+
+  vendor Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  @@unique([vendorId, periodStart, periodEnd])
+  @@index([vendorId])
+}
+
 // PURCHASE REQUESTS
 // ===========================================================================
 
+// The request lifecycle. Transitions are enforced in `src/server/state-machine.ts`;
+// no service writes `status` without going through it.
+//
+//   DRAFT → SUBMITTED → UNDER_REVIEW → APPROVED → IN_PROCUREMENT → ORDERED
+//         → PARTIALLY_FULFILLED → FULFILLED → CLOSED
+//
+// RETURNED sends a request back to its owner for revision without rejecting it.
 enum RequestStatus {
   DRAFT
   SUBMITTED
   UNDER_REVIEW
   APPROVED
+  RETURNED
   REJECTED
   CANCELLED
-  COMPLETED
+  IN_PROCUREMENT
+  ORDERED
+  PARTIALLY_FULFILLED
+  FULFILLED
+  CLOSED
 }
 
 enum Priority {
@@ -419,65 +761,89 @@ enum Priority {
 }
 
 model PurchaseRequest {
-  id             String        @id @default(cuid())
-  organizationId String
-  requestNumber  String
-  title          String
-  departmentId   String?
-  requestedById  String
-  status         RequestStatus @default(DRAFT)
-  priority       Priority      @default(MEDIUM)
-  category       String?
+  id                    String        @id @default(cuid())
+  organizationId        String
+  requestNumber         String
+  title                 String
+  departmentId          String?
+  requestedById         String
+  status                RequestStatus @default(DRAFT)
+  priority              Priority      @default(MEDIUM)
+  category              String?
   // JSON string array.
-  tags           String?
+  tags                  String?
   businessJustification String?
-  neededByDate   DateTime?
-  totalEstimated Float         @default(0)
-  currency       String        @default("USD")
-  version        Int           @default(1)
+  neededByDate          DateTime?
+  totalEstimated        Decimal       @default(0) @db.Decimal(18, 4)
+  currency              String        @default("USD")
+  version               Int           @default(1)
 
   // Workflow selected at submission time; pinned so later config changes don't
   // retroactively alter an in-flight approval chain.
-  workflowId     String?
+  workflowId String?
 
-  submittedAt    DateTime?
-  completedAt    DateTime?
-  cancelledAt    DateTime?
-  createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt
+  // Where the money comes from and where it is charged.
+  budgetId     String?
+  costCenterId String?
+  categoryId   String?
+  branchId     String?
 
-  organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  department   Department?       @relation(fields: [departmentId], references: [id])
-  requestedBy  User              @relation("RequestRequester", fields: [requestedById], references: [id])
-  workflow     ApprovalWorkflow? @relation(fields: [workflowId], references: [id])
+  submittedAt     DateTime?
+  approvedAt      DateTime?
+  rejectedAt      DateTime?
+  rejectionReason String?
+  returnedAt      DateTime?
+  returnReason    String?
+  orderedAt       DateTime?
+  fulfilledAt     DateTime?
+  closedAt        DateTime?
+  cancelledAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
-  lineItems      RequestLineItem[]
-  approvals      ApprovalStep[]
-  comments       Comment[]
-  watchers       RequestWatcher[]
-  versionHistory RequestVersion[]
-  rfqs           RFQ[]
-  purchaseOrders PurchaseOrder[]
-  activities     ActivityLog[]
-  budgetEntries  BudgetEntry[]
+  organization Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  department   Department?          @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  requestedBy  User                 @relation("RequestRequester", fields: [requestedById], references: [id], onDelete: Restrict)
+  workflow     ApprovalWorkflow?    @relation(fields: [workflowId], references: [id], onDelete: SetNull)
+  budget       Budget?              @relation(fields: [budgetId], references: [id], onDelete: SetNull)
+  costCenter   CostCenter?          @relation(fields: [costCenterId], references: [id], onDelete: SetNull)
+  categoryRef  ProcurementCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  lineItems         RequestLineItem[]
+  approvals         ApprovalStep[]
+  comments          Comment[]
+  watchers          RequestWatcher[]
+  versionHistory    RequestVersion[]
+  rfqs              RFQ[]
+  purchaseOrders    PurchaseOrder[]
+  activities        ActivityLog[]
+  budgetEntries     BudgetEntry[]
+  approvalInstances ApprovalInstance[]
 
   @@unique([organizationId, requestNumber])
   @@index([organizationId])
   @@index([organizationId, status])
   @@index([departmentId])
   @@index([requestedById])
+  @@index([budgetId])
+  @@index([costCenterId])
+  @@index([categoryId])
+  @@index([organizationId, createdAt])
+  @@index([workflowId])
 }
 
 model RequestLineItem {
-  id            String  @id @default(cuid())
+  id            String   @id @default(cuid())
   requestId     String
   itemName      String
   description   String?
-  quantity      Float
-  unit          String  @default("unit")
-  estimatedCost Float
-  taxRate       Float   @default(0)
-  sortOrder     Int     @default(0)
+  quantity      Decimal  @db.Decimal(18, 4)
+  unit          String   @default("unit")
+  estimatedCost Decimal  @db.Decimal(18, 4)
+  taxRate       Decimal  @default(0) @db.Decimal(9, 4)
+  sortOrder     Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @default(now()) @updatedAt
 
   request PurchaseRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
 
@@ -486,14 +852,14 @@ model RequestLineItem {
 
 // Immutable snapshot taken whenever an approved-stage request is edited.
 model RequestVersion {
-  id        String   @id @default(cuid())
-  requestId String
-  version   Int
+  id          String   @id @default(cuid())
+  requestId   String
+  version     Int
   // Full JSON snapshot of the request at this version.
-  snapshot  String
-  reason    String?
+  snapshot    String
+  reason      String?
   changedById String
-  createdAt DateTime @default(now())
+  createdAt   DateTime @default(now())
 
   request PurchaseRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
 
@@ -506,6 +872,7 @@ model RequestWatcher {
   requestId String
   userId    String
   createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
 
   request PurchaseRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
   user    User            @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -536,33 +903,35 @@ model Comment {
   createdAt  DateTime          @default(now())
   updatedAt  DateTime          @updatedAt
 
-  author  User             @relation(fields: [authorId], references: [id])
+  author  User             @relation(fields: [authorId], references: [id], onDelete: Restrict)
   request PurchaseRequest? @relation(fields: [requestId], references: [id], onDelete: Cascade)
 
   @@index([entityType, entityId])
   @@index([authorId])
+  @@index([requestId])
 }
 
 model RequestTemplate {
-  id             String   @id @default(cuid())
-  organizationId String
-  name           String
-  description    String?
-  category       String?
-  departmentId   String?
-  priority       Priority @default(MEDIUM)
+  id                   String   @id @default(cuid())
+  organizationId       String
+  name                 String
+  description          String?
+  category             String?
+  departmentId         String?
+  priority             Priority @default(MEDIUM)
   // JSON array of line-item shapes.
-  defaultLineItems String
+  defaultLineItems     String
   defaultJustification String?
-  usageCount     Int      @default(0)
-  createdById    String
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  usageCount           Int      @default(0)
+  createdById          String
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  department   Department?  @relation(fields: [departmentId], references: [id])
+  department   Department?  @relation(fields: [departmentId], references: [id], onDelete: SetNull)
 
   @@index([organizationId])
+  @@index([departmentId])
 }
 
 enum RecurrenceFrequency {
@@ -585,6 +954,7 @@ model RecurringRequest {
   isActive       Boolean             @default(true)
   createdById    String
   createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @default(now()) @updatedAt
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
@@ -603,6 +973,26 @@ enum ApprovalStage {
   EXECUTIVE
 }
 
+// What a workflow governs. One engine approves requests, purchase orders,
+// invoices, payments, contracts and budgets — the entity type is data.
+enum ApprovalEntityType {
+  REQUEST
+  PURCHASE_ORDER
+  INVOICE
+  PAYMENT
+  CONTRACT
+  BUDGET
+  VENDOR
+}
+
+enum ApprovalInstanceStatus {
+  IN_PROGRESS
+  APPROVED
+  REJECTED
+  CANCELLED
+  RETURNED
+}
+
 enum ApprovalDecision {
   PENDING
   APPROVED
@@ -613,77 +1003,175 @@ enum ApprovalDecision {
 }
 
 model ApprovalWorkflow {
-  id             String   @id @default(cuid())
-  organizationId String
-  name           String
-  description    String?
-  isActive       Boolean  @default(true)
+  id                String             @id @default(cuid())
+  organizationId    String
+  name              String
+  description       String?
+  isActive          Boolean            @default(true)
+  entityType        ApprovalEntityType @default(REQUEST)
+  // Workflows are versioned rather than edited in place: an in-flight approval
+  // keeps the version it started under, and history stays explicable.
+  version           Int                @default(1)
+  supersededById    String?            @unique
   // Selection predicate. A request picks the highest-priority active workflow whose
   // threshold/priority/department/category filters all match.
-  thresholdMin   Float?
-  thresholdMax   Float?
+  thresholdMin      Decimal?           @db.Decimal(18, 4)
+  thresholdMax      Decimal?           @db.Decimal(18, 4)
   // JSON arrays; null means "no constraint on this dimension".
-  priorityFilter   String?
-  departmentFilter String?
-  categoryFilter   String?
-  selectionPriority Int    @default(0)
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  priorityFilter    String?
+  departmentFilter  String?
+  categoryFilter    String?
+  selectionPriority Int                @default(0)
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
 
   organization Organization            @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   stages       ApprovalWorkflowStage[]
+  instances    ApprovalInstance[]
+  supersededBy ApprovalWorkflow?       @relation("WorkflowVersions", fields: [supersededById], references: [id], onDelete: SetNull)
+  supersedes   ApprovalWorkflow?       @relation("WorkflowVersions")
   requests     PurchaseRequest[]
 
+  @@unique([organizationId, name, version])
   @@index([organizationId])
   @@index([organizationId, isActive])
+  @@index([organizationId, entityType, isActive])
 }
 
 model ApprovalWorkflowStage {
-  id              String        @id @default(cuid())
-  workflowId      String
-  name            String
-  stage           ApprovalStage
-  approverRole    UserRole
-  sequence        Int
-  slaHours        Int           @default(48)
-  escalationRole  UserRole?
-  allowDelegation Boolean       @default(true)
+  id                 String        @id @default(cuid())
+  workflowId         String
+  name               String
+  stage              ApprovalStage
+  approverRole       UserRole
+  sequence           Int
+  slaHours           Int           @default(48)
+  escalationRole     UserRole?
+  allowDelegation    Boolean       @default(true)
   // Stages sharing a `sequence` run in parallel; all must approve to advance.
-  isParallel      Boolean       @default(false)
+  isParallel         Boolean       @default(false)
   // Optional predicate — stage is skipped when it does not match.
-  conditionMinAmount Float?
-  conditionMaxAmount Float?
+  conditionMinAmount Decimal?      @db.Decimal(18, 4)
+  conditionMaxAmount Decimal?      @db.Decimal(18, 4)
+  description        String?
+  // Configured role targets. When set these win over the legacy enum columns,
+  // which is what lets an organization route approval to a role it invented.
+  approverRoleId     String?
+  escalationRoleId   String?
+  // For parallel stages: how many of the assigned approvers must approve.
+  // 0 means "all of them".
+  minApprovals       Int           @default(0)
+  isMandatory        Boolean       @default(true)
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @default(now()) @updatedAt
 
-  workflow ApprovalWorkflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  workflow          ApprovalWorkflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  approverRoleRef   Role?            @relation("StageApproverRole", fields: [approverRoleId], references: [id], onDelete: SetNull)
+  escalationRoleRef Role?            @relation("StageEscalationRole", fields: [escalationRoleId], references: [id], onDelete: SetNull)
+  steps             ApprovalStep[]
 
   @@index([workflowId])
+  @@index([approverRoleId])
+  @@index([escalationRoleId])
+}
+
+// One running approval over one entity. This is what makes the engine generic:
+// the steps below hang off an instance, and the instance names what is being
+// approved. A request keeps its direct `requestId` link so the existing
+// request → approvals relation stays a first-class query.
+model ApprovalInstance {
+  id             String                 @id @default(cuid())
+  organizationId String
+  workflowId     String?
+  entityType     ApprovalEntityType
+  entityId       String
+  requestId      String?
+  status         ApprovalInstanceStatus @default(IN_PROGRESS)
+  // Snapshot of the facts the workflow was selected on, so a later change to the
+  // entity cannot make the routing look wrong in hindsight.
+  amount         Decimal?               @db.Decimal(18, 4)
+  currency       String                 @default("USD")
+  context        Json?
+  startedAt      DateTime               @default(now())
+  completedAt    DateTime?
+  decidedById    String?
+  outcomeReason  String?
+  createdAt      DateTime               @default(now())
+  updatedAt      DateTime               @default(now()) @updatedAt
+
+  organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  workflow     ApprovalWorkflow? @relation(fields: [workflowId], references: [id], onDelete: SetNull)
+  request      PurchaseRequest?  @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  decidedBy    User?             @relation("ApprovalInstanceDecidedBy", fields: [decidedById], references: [id], onDelete: SetNull)
+  steps        ApprovalStep[]
+
+  @@index([organizationId, status])
+  @@index([entityType, entityId])
+  @@index([requestId])
+  @@index([workflowId])
+  @@index([decidedById])
+}
+
+// Standing delegation: "while I am away, my approvals go to X". Distinct from the
+// per-step `delegatedToId`, which records a delegation that actually happened.
+model ApprovalDelegation {
+  id             String              @id @default(cuid())
+  organizationId String
+  fromUserId     String
+  toUserId       String
+  // Null means every approval the delegator would receive.
+  entityType     ApprovalEntityType?
+  reason         String?
+  startsAt       DateTime            @default(now())
+  endsAt         DateTime?
+  isActive       Boolean             @default(true)
+  createdAt      DateTime            @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  fromUser     User         @relation("DelegationFrom", fields: [fromUserId], references: [id], onDelete: Cascade)
+  toUser       User         @relation("DelegationTo", fields: [toUserId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, isActive])
+  @@index([fromUserId, isActive])
+  @@index([toUserId])
 }
 
 model ApprovalStep {
-  id           String           @id @default(cuid())
-  requestId    String
-  stage        ApprovalStage
-  sequence     Int              @default(0)
-  approverId   String
-  approverRole UserRole
-  decision     ApprovalDecision @default(PENDING)
-  comment      String?
-  delegatedToId String?
-  decidedAt    DateTime?
-  slaHours     Int              @default(48)
-  slaExpiresAt DateTime?
-  isEscalated  Boolean          @default(false)
-  escalatedAt  DateTime?
-  remindersSent Int             @default(0)
-  createdAt    DateTime         @default(now())
+  id              String           @id @default(cuid())
+  instanceId      String?
+  requestId       String?
+  stageId         String?
+  stage           ApprovalStage
+  sequence        Int              @default(0)
+  approverId      String
+  approverRole    UserRole
+  approverRoleId  String?
+  decision        ApprovalDecision @default(PENDING)
+  comment         String?
+  rejectionReason String?
+  delegatedToId   String?
+  decidedById     String?
+  decidedAt       DateTime?
+  slaHours        Int              @default(48)
+  slaExpiresAt    DateTime?
+  isEscalated     Boolean          @default(false)
+  escalatedAt     DateTime?
+  remindersSent   Int              @default(0)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @default(now()) @updatedAt
 
-  request     PurchaseRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
-  approver    User            @relation("ApprovalApprover", fields: [approverId], references: [id])
-  delegatedTo User?           @relation("ApprovalDelegate", fields: [delegatedToId], references: [id])
+  instance    ApprovalInstance?      @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  request     PurchaseRequest?       @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  stageRef    ApprovalWorkflowStage? @relation(fields: [stageId], references: [id], onDelete: SetNull)
+  approver    User                   @relation("ApprovalApprover", fields: [approverId], references: [id], onDelete: Restrict)
+  delegatedTo User?                  @relation("ApprovalDelegate", fields: [delegatedToId], references: [id], onDelete: SetNull)
 
   @@index([requestId])
+  @@index([instanceId])
   @@index([approverId, decision])
   @@index([slaExpiresAt])
+  @@index([stageId])
+  @@index([delegatedToId])
 }
 
 // ===========================================================================
@@ -694,51 +1182,66 @@ enum RFQStatus {
   DRAFT
   WAITING
   RECEIVED
+  EVALUATING
+  AWARDED
   EXPIRED
   CLOSED
   CANCELLED
 }
 
 model RFQ {
-  id             String    @id @default(cuid())
-  organizationId String
-  rfqNumber      String
-  requestId      String?
-  title          String
-  description    String?
-  deadline       DateTime
-  status         RFQStatus @default(DRAFT)
-  selectedQuotationId String? @unique
-  awardedAt      DateTime?
-  awardedById    String?
-  remindersSent  Int       @default(0)
-  createdById    String?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  id                  String              @id @default(cuid())
+  organizationId      String
+  rfqNumber           String
+  requestId           String?
+  title               String
+  description         String?
+  deadline            DateTime
+  status              RFQStatus           @default(DRAFT)
+  categoryId          String?
+  currency            String              @default("USD")
+  // Sealed bidding: quotations stay unreadable to the buyer until the deadline.
+  isSealed            Boolean             @default(false)
+  evaluationMethod    RFQEvaluationMethod @default(LOWEST_PRICE)
+  evaluatedAt         DateTime?
+  selectedQuotationId String?             @unique
+  awardedAt           DateTime?
+  awardedById         String?
+  remindersSent       Int                 @default(0)
+  createdById         String?
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
 
-  organization   Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  request        PurchaseRequest? @relation(fields: [requestId], references: [id])
-  lineItems      RFQLineItem[]
-  invitedVendors RFQVendor[]
-  quotations     Quotation[]      @relation("RFQQuotations")
-  selectedQuotation Quotation?    @relation("RFQSelectedQuotation", fields: [selectedQuotationId], references: [id])
-  purchaseOrders PurchaseOrder[]
-  activities     ActivityLog[]
+  organization      Organization             @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  request           PurchaseRequest?         @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  categoryRef       ProcurementCategory?     @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  criteria          RFQEvaluationCriterion[]
+  awards            RFQAward[]
+  lineItems         RFQLineItem[]
+  invitedVendors    RFQVendor[]
+  quotations        Quotation[]              @relation("RFQQuotations")
+  selectedQuotation Quotation?               @relation("RFQSelectedQuotation", fields: [selectedQuotationId], references: [id], onDelete: SetNull)
+  purchaseOrders    PurchaseOrder[]
+  activities        ActivityLog[]
 
   @@unique([organizationId, rfqNumber])
   @@index([organizationId])
   @@index([organizationId, status])
   @@index([deadline])
+  @@index([requestId])
+  @@index([categoryId])
 }
 
 model RFQLineItem {
-  id          String  @id @default(cuid())
+  id          String   @id @default(cuid())
   rfqId       String
   itemName    String
   description String?
-  quantity    Float
-  unit        String  @default("unit")
-  sortOrder   Int     @default(0)
+  quantity    Decimal  @db.Decimal(18, 4)
+  unit        String   @default("unit")
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now()) @updatedAt
 
   rfq RFQ @relation(fields: [rfqId], references: [id], onDelete: Cascade)
 
@@ -753,13 +1256,13 @@ enum RFQInvitationStatus {
 }
 
 model RFQVendor {
-  id         String              @id @default(cuid())
-  rfqId      String
-  vendorId   String
-  status     RFQInvitationStatus @default(INVITED)
-  invitedAt  DateTime            @default(now())
-  viewedAt   DateTime?
-  declinedAt DateTime?
+  id            String              @id @default(cuid())
+  rfqId         String
+  vendorId      String
+  status        RFQInvitationStatus @default(INVITED)
+  invitedAt     DateTime            @default(now())
+  viewedAt      DateTime?
+  declinedAt    DateTime?
   declineReason String?
 
   rfq    RFQ    @relation(fields: [rfqId], references: [id], onDelete: Cascade)
@@ -781,47 +1284,67 @@ enum QuotationStatus {
 }
 
 model Quotation {
-  id           String          @id @default(cuid())
-  rfqId        String
-  vendorId     String
-  revision     Int             @default(1)
-  totalAmount  Float
-  currency     String          @default("USD")
-  deliveryDays Int             @default(0)
-  warranty     String?
-  paymentTerms String?
-  validUntil   DateTime?
-  notes        String?
-  status       QuotationStatus @default(SUBMITTED)
+  id                        String          @id @default(cuid())
+  // Carried directly rather than only through the RFQ: a supplier submits against
+  // a quotation id, and that path must be tenant-scoped without a join.
+  organizationId            String
+  rfqId                     String
+  vendorId                  String
+  revision                  Int             @default(1)
+  totalAmount               Decimal         @db.Decimal(18, 4)
+  currency                  String          @default("USD")
+  deliveryDays              Int             @default(0)
+  warranty                  String?
+  paymentTerms              String?
+  validUntil                DateTime?
+  notes                     String?
+  status                    QuotationStatus @default(SUBMITTED)
   // Set when procurement scores the bid during evaluation.
-  evaluationScore Float?
-  evaluationNotes String?
-  submittedAt  DateTime        @default(now())
-  createdAt    DateTime        @default(now())
-  updatedAt    DateTime        @updatedAt
+  evaluationScore           Float?
+  evaluationNotes           String?
+  // Weighted total of the QuotationScore rows, recomputed on each scoring change.
+  weightedScore             Float?
+  rank                      Int?
+  isCompliant               Boolean         @default(true)
+  complianceNotes           String?
+  awardedAt                 DateTime?
+  // Who submitted it: a buyer entering a bid on the supplier's behalf, or the
+  // supplier themselves through the portal. Exactly one is set.
+  submittedByUserId         String?
+  submittedBySupplierUserId String?
+  submittedAt               DateTime        @default(now())
+  createdAt                 DateTime        @default(now())
+  updatedAt                 DateTime        @updatedAt
 
-  rfq            RFQ                @relation("RFQQuotations", fields: [rfqId], references: [id], onDelete: Cascade)
-  selectedForRfq RFQ?               @relation("RFQSelectedQuotation")
-  vendor         Vendor             @relation(fields: [vendorId], references: [id])
+  rfq            RFQ                 @relation("RFQQuotations", fields: [rfqId], references: [id], onDelete: Cascade)
+  selectedForRfq RFQ?                @relation("RFQSelectedQuotation")
+  organization   Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  vendor         Vendor              @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  scores         QuotationScore[]
+  awards         RFQAward[]
   lineItems      QuotationLineItem[]
   purchaseOrders PurchaseOrder[]
 
   @@unique([rfqId, vendorId, revision])
   @@index([rfqId])
   @@index([vendorId])
+  @@index([organizationId])
+  @@index([organizationId, status])
 }
 
 model QuotationLineItem {
-  id            String  @id @default(cuid())
+  id            String   @id @default(cuid())
   quotationId   String
   rfqLineItemId String?
   itemName      String
   description   String?
-  quantity      Float
-  unit          String  @default("unit")
-  unitPrice     Float
-  taxRate       Float   @default(0)
-  sortOrder     Int     @default(0)
+  quantity      Decimal  @db.Decimal(18, 4)
+  unit          String   @default("unit")
+  unitPrice     Decimal  @db.Decimal(18, 4)
+  taxRate       Decimal  @default(0) @db.Decimal(9, 4)
+  sortOrder     Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @default(now()) @updatedAt
 
   quotation Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
 
@@ -829,12 +1352,107 @@ model QuotationLineItem {
 }
 
 // ===========================================================================
+enum RFQEvaluationMethod {
+  LOWEST_PRICE
+  WEIGHTED_SCORE
+  QUALITY_THEN_PRICE
+}
+
+enum EvaluationCriterionType {
+  PRICE
+  DELIVERY
+  QUALITY
+  COMPLIANCE
+  WARRANTY
+  EXPERIENCE
+  OTHER
+}
+
+// What the bids are judged on, and how heavily. Defined before quotations arrive
+// so the yardstick cannot be chosen after seeing the numbers.
+model RFQEvaluationCriterion {
+  id            String                  @id @default(cuid())
+  rfqId         String
+  name          String
+  type          EvaluationCriterionType @default(OTHER)
+  // Relative weight within the RFQ. Weights are normalised at scoring time, so
+  // they need not sum to 100.
+  weight        Float                   @default(1)
+  // Higher score wins for most criteria; price-like criteria invert.
+  lowerIsBetter Boolean                 @default(false)
+  maxScore      Float                   @default(10)
+  sortOrder     Int                     @default(0)
+  createdAt     DateTime                @default(now())
+
+  rfq    RFQ              @relation(fields: [rfqId], references: [id], onDelete: Cascade)
+  scores QuotationScore[]
+
+  @@unique([rfqId, name])
+  @@index([rfqId])
+}
+
+// One evaluator's score for one bid against one criterion. Kept per criterion
+// rather than as a single number so an award can be defended line by line.
+model QuotationScore {
+  id          String   @id @default(cuid())
+  quotationId String
+  criterionId String
+  score       Float
+  notes       String?
+  scoredById  String?
+  scoredAt    DateTime @default(now())
+
+  quotation Quotation              @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  criterion RFQEvaluationCriterion @relation(fields: [criterionId], references: [id], onDelete: Cascade)
+  scoredBy  User?                  @relation(fields: [scoredById], references: [id], onDelete: SetNull)
+
+  @@unique([quotationId, criterionId])
+  @@index([quotationId])
+  @@index([criterionId])
+  @@index([scoredById])
+}
+
+// The award decision itself, kept as a record rather than as a flag on the RFQ.
+// An RFQ may be split across suppliers, and a cancelled award must remain visible.
+model RFQAward {
+  id              String    @id @default(cuid())
+  organizationId  String
+  rfqId           String
+  quotationId     String
+  vendorId        String
+  awardedAmount   Decimal   @db.Decimal(18, 4)
+  currency        String    @default("USD")
+  justification   String?
+  awardedById     String?
+  awardedAt       DateTime  @default(now())
+  cancelledAt     DateTime?
+  cancelledReason String?
+
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  rfq            RFQ             @relation(fields: [rfqId], references: [id], onDelete: Cascade)
+  quotation      Quotation       @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  vendor         Vendor          @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  awardedBy      User?           @relation(fields: [awardedById], references: [id], onDelete: SetNull)
+  purchaseOrders PurchaseOrder[]
+
+  @@index([organizationId])
+  @@index([rfqId])
+  @@index([vendorId])
+  @@index([quotationId])
+  @@index([awardedById])
+}
+
 // PURCHASE ORDERS
 // ===========================================================================
 
+// PO lifecycle. Enforced by the state machine, and driven by cumulative receipts
+// rather than set by hand: PARTIALLY_RECEIVED and RECEIVED are computed from the
+// receipt ledger, never asserted by a caller.
 enum PurchaseOrderStatus {
   DRAFT
   PENDING_APPROVAL
+  APPROVED
+  REJECTED
   ISSUED
   ACKNOWLEDGED
   IN_DELIVERY
@@ -853,83 +1471,117 @@ model PurchaseOrder {
   quotationId    String?
   vendorId       String
   contractId     String?
+  awardId        String?
+  departmentId   String?
+  costCenterId   String?
+  budgetId       String?
+  categoryId     String?
   status         PurchaseOrderStatus @default(DRAFT)
 
-  subtotal       Float               @default(0)
-  taxRate        Float               @default(0)
-  taxAmount      Float               @default(0)
-  discountAmount Float               @default(0)
-  totalAmount    Float               @default(0)
-  currency       String              @default("USD")
+  subtotal       Decimal @default(0) @db.Decimal(18, 4)
+  taxRate        Decimal @default(0) @db.Decimal(9, 4)
+  taxAmount      Decimal @default(0) @db.Decimal(18, 4)
+  discountAmount Decimal @default(0) @db.Decimal(18, 4)
+  totalAmount    Decimal @default(0) @db.Decimal(18, 4)
+  currency       String  @default("USD")
 
   termsAndConditions String?
-  notes          String?
-  deliveryAddress String?
-  paymentTerms   String?
+  notes              String?
+  deliveryAddress    String?
+  paymentTerms       String?
 
-  version        Int                 @default(1)
-  issuedAt       DateTime?
-  acknowledgedAt DateTime?
+  version          Int       @default(1)
+  approvedById     String?
+  approvedAt       DateTime?
+  rejectedAt       DateTime?
+  rejectionReason  String?
+  issuedAt         DateTime?
+  acknowledgedAt   DateTime?
   expectedDelivery DateTime?
-  receivedAt     DateTime?
-  closedAt       DateTime?
-  cancelledAt    DateTime?
-  cancelledReason String?
-  createdById    String?
-  createdAt      DateTime            @default(now())
-  updatedAt      DateTime            @updatedAt
+  receivedAt       DateTime?
+  closedAt         DateTime?
+  cancelledAt      DateTime?
+  cancelledReason  String?
+  createdById      String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
 
-  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  request      PurchaseRequest? @relation(fields: [requestId], references: [id])
-  rfq          RFQ?             @relation(fields: [rfqId], references: [id])
-  quotation    Quotation?       @relation(fields: [quotationId], references: [id])
-  vendor       Vendor           @relation(fields: [vendorId], references: [id])
-  contract     Contract?        @relation(fields: [contractId], references: [id])
+  organization Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  request      PurchaseRequest?     @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  rfq          RFQ?                 @relation(fields: [rfqId], references: [id], onDelete: SetNull)
+  quotation    Quotation?           @relation(fields: [quotationId], references: [id], onDelete: SetNull)
+  vendor       Vendor               @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  contract     Contract?            @relation(fields: [contractId], references: [id], onDelete: SetNull)
+  award        RFQAward?            @relation(fields: [awardId], references: [id], onDelete: SetNull)
+  department   Department?          @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  costCenter   CostCenter?          @relation(fields: [costCenterId], references: [id], onDelete: SetNull)
+  budget       Budget?              @relation(fields: [budgetId], references: [id], onDelete: SetNull)
+  categoryRef  ProcurementCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
 
-  lineItems     POLineItem[]
-  revisions     PORevision[]
-  goodsReceipts GoodsReceipt[]
-  invoices      Invoice[]
-  assets        Asset[]
+  lineItems      POLineItem[]
+  revisions      PORevision[]
+  goodsReceipts  GoodsReceipt[]
+  invoices       Invoice[]
+  assets         Asset[]
   stockMovements StockMovement[]
-  activities    ActivityLog[]
-  budgetEntries BudgetEntry[]
+  activities     ActivityLog[]
+  budgetEntries  BudgetEntry[]
 
   @@unique([organizationId, poNumber])
   @@index([organizationId])
   @@index([organizationId, status])
   @@index([vendorId])
   @@index([requestId])
+  @@index([budgetId])
+  @@index([costCenterId])
+  @@index([departmentId])
+  @@index([contractId])
+  @@index([organizationId, createdAt])
+  @@index([rfqId])
+  @@index([quotationId])
+  @@index([awardId])
+  @@index([categoryId])
 }
 
 // The four-quantity model required by the P2P lifecycle:
 // ordered ≠ received ≠ invoiced ≠ paid. Each is tracked independently per line.
 model POLineItem {
-  id            String  @id @default(cuid())
-  purchaseOrderId String
-  itemName      String
-  description   String?
-  unit          String  @default("unit")
-  unitPrice     Float
-  taxRate       Float   @default(0)
-  sortOrder     Int     @default(0)
+  id                  String   @id @default(cuid())
+  purchaseOrderId     String
+  // Traceability back up the chain: which request line asked for this, and which
+  // quoted line priced it.
+  requestLineItemId   String?
+  quotationLineItemId String?
+  warehouseId         String?
+  itemName            String
+  description         String?
+  unit                String   @default("unit")
+  unitPrice           Decimal  @db.Decimal(18, 4)
+  taxRate             Decimal  @default(0) @db.Decimal(9, 4)
+  sortOrder           Int      @default(0)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @default(now()) @updatedAt
 
-  orderedQty    Float   @default(0)
-  receivedQty   Float   @default(0)
-  rejectedQty   Float   @default(0)
-  invoicedQty   Float   @default(0)
+  orderedQty  Decimal @default(0) @db.Decimal(18, 4)
+  receivedQty Decimal @default(0) @db.Decimal(18, 4)
+  rejectedQty Decimal @default(0) @db.Decimal(18, 4)
+  invoicedQty Decimal @default(0) @db.Decimal(18, 4)
 
   // Set when this line should become a tracked asset on receipt.
-  createsAsset      Boolean @default(false)
-  assetCategory     String?
+  createsAsset    Boolean @default(false)
+  assetCategory   String?
   // Set when this line should post into inventory on receipt.
-  inventoryItemId   String?
+  inventoryItemId String?
 
   purchaseOrder PurchaseOrder      @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
-  inventoryItem InventoryItem?     @relation(fields: [inventoryItemId], references: [id])
+  inventoryItem InventoryItem?     @relation(fields: [inventoryItemId], references: [id], onDelete: SetNull)
   receiptItems  GoodsReceiptItem[]
+  warehouse     Warehouse?         @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
+  invoiceLines  InvoiceLineItem[]
 
   @@index([purchaseOrderId])
+  @@index([inventoryItemId])
+  @@index([warehouseId])
 }
 
 model PORevision {
@@ -967,34 +1619,42 @@ enum ReceiptItemCondition {
 }
 
 model GoodsReceipt {
-  id             String             @id @default(cuid())
-  organizationId String
-  receiptNumber  String
+  id              String             @id @default(cuid())
+  organizationId  String
+  receiptNumber   String
   purchaseOrderId String
-  vendorId       String
-  receivedById   String
-  status         GoodsReceiptStatus @default(DRAFT)
-  receivedDate   DateTime           @default(now())
-  location       String?
+  vendorId        String
+  receivedById    String
+  status          GoodsReceiptStatus @default(DRAFT)
+  receivedDate    DateTime           @default(now())
+  location        String?
+  warehouseId     String?
+  carrier         String?
+  waybillNumber   String?
+  inspectedById   String?
+  inspectedAt     DateTime?
   deliveryNoteRef String?
-  notes          String?
-  postedAt       DateTime?
-  createdAt      DateTime           @default(now())
-  updatedAt      DateTime           @updatedAt
+  notes           String?
+  postedAt        DateTime?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
 
-  organization  Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  purchaseOrder PurchaseOrder      @relation(fields: [purchaseOrderId], references: [id])
-  vendor        Vendor             @relation(fields: [vendorId], references: [id])
-  receivedBy    User               @relation(fields: [receivedById], references: [id])
-  items         GoodsReceiptItem[]
-  invoices      Invoice[]
-  assets        Asset[]
+  organization   Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  purchaseOrder  PurchaseOrder      @relation(fields: [purchaseOrderId], references: [id], onDelete: Restrict)
+  vendor         Vendor             @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  receivedBy     User               @relation(fields: [receivedById], references: [id], onDelete: Restrict)
+  warehouse      Warehouse?         @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
+  items          GoodsReceiptItem[]
+  invoices       Invoice[]
+  assets         Asset[]
   stockMovements StockMovement[]
 
   @@unique([organizationId, receiptNumber])
   @@index([organizationId])
   @@index([purchaseOrderId])
   @@index([vendorId])
+  @@index([receivedById])
+  @@index([warehouseId])
 }
 
 model GoodsReceiptItem {
@@ -1002,18 +1662,32 @@ model GoodsReceiptItem {
   goodsReceiptId String
   poLineItemId   String
   itemName       String
-  orderedQty     Float
-  receivedQty    Float                @default(0)
-  rejectedQty    Float                @default(0)
+  orderedQty     Decimal              @db.Decimal(18, 4)
+  receivedQty    Decimal              @default(0) @db.Decimal(18, 4)
+  // Four independent quantities per delivered line. `receivedQty` means *accepted*
+  // into stock; damaged and rejected units are recorded but never posted to it.
+  deliveredQty   Decimal              @default(0) @db.Decimal(18, 4)
+  rejectedQty    Decimal              @default(0) @db.Decimal(18, 4)
+  damagedQty     Decimal              @default(0) @db.Decimal(18, 4)
+  batchNumber    String?
+  expiryDate     DateTime?
+  // JSON array of serial numbers, for lines that become tracked assets.
+  serialNumbers  Json?
+  warehouseId    String?
   unit           String               @default("unit")
   condition      ReceiptItemCondition @default(GOOD)
   notes          String?
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @default(now()) @updatedAt
 
   goodsReceipt GoodsReceipt @relation(fields: [goodsReceiptId], references: [id], onDelete: Cascade)
-  poLineItem   POLineItem   @relation(fields: [poLineItemId], references: [id])
+  poLineItem   POLineItem   @relation(fields: [poLineItemId], references: [id], onDelete: Restrict)
+  warehouse    Warehouse?   @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
+  assets       Asset[]
 
   @@index([goodsReceiptId])
   @@index([poLineItemId])
+  @@index([warehouseId])
 }
 
 // ===========================================================================
@@ -1044,47 +1718,54 @@ enum MatchStatus {
 }
 
 model Invoice {
-  id             String        @id @default(cuid())
-  organizationId String
-  invoiceNumber  String
+  id               String        @id @default(cuid())
+  organizationId   String
+  invoiceNumber    String
   // The vendor's own invoice reference — used for duplicate detection.
   vendorInvoiceRef String?
-  vendorId       String
-  purchaseOrderId String?
-  goodsReceiptId String?
-  status         InvoiceStatus @default(DRAFT)
+  vendorId         String
+  purchaseOrderId  String?
+  goodsReceiptId   String?
+  costCenterId     String?
+  departmentId     String?
+  paymentTerms     String?
+  status           InvoiceStatus @default(DRAFT)
 
-  issueDate      DateTime
-  dueDate        DateTime
-  subtotal       Float         @default(0)
-  taxAmount      Float         @default(0)
-  totalAmount    Float         @default(0)
-  paidAmount     Float         @default(0)
-  balance        Float         @default(0)
-  currency       String        @default("USD")
+  issueDate   DateTime
+  dueDate     DateTime
+  subtotal    Decimal  @default(0) @db.Decimal(18, 4)
+  taxAmount   Decimal  @default(0) @db.Decimal(18, 4)
+  totalAmount Decimal  @default(0) @db.Decimal(18, 4)
+  paidAmount  Decimal  @default(0) @db.Decimal(18, 4)
+  balance     Decimal  @default(0) @db.Decimal(18, 4)
+  currency    String   @default("USD")
 
   // 3-way match outcome (PO ↔ receipt ↔ invoice), computed by the matching service.
-  matchStatus     MatchStatus  @default(NOT_MATCHED)
-  matchVariance   Float?
-  matchNotes      String?
-  isDuplicateOf   String?
+  matchStatus   MatchStatus @default(NOT_MATCHED)
+  matchVariance Decimal?    @db.Decimal(18, 4)
+  matchNotes    String?
+  matchedAt     DateTime?
+  isDuplicateOf String?
 
   notes          String?
   submittedById  String?
   approvedById   String?
   approvedAt     DateTime?
   rejectedReason String?
-  createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
-  organization  Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  vendor        Vendor         @relation(fields: [vendorId], references: [id])
-  purchaseOrder PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
-  goodsReceipt  GoodsReceipt?  @relation(fields: [goodsReceiptId], references: [id])
-  approvedBy    User?          @relation("InvoiceApprover", fields: [approvedById], references: [id])
-  lineItems     InvoiceLineItem[]
-  payments      Payment[]
-  budgetEntries BudgetEntry[]
+  organization    Organization            @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  vendor          Vendor                  @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  purchaseOrder   PurchaseOrder?          @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
+  goodsReceipt    GoodsReceipt?           @relation(fields: [goodsReceiptId], references: [id], onDelete: SetNull)
+  approvedBy      User?                   @relation("InvoiceApprover", fields: [approvedById], references: [id], onDelete: SetNull)
+  costCenter      CostCenter?             @relation(fields: [costCenterId], references: [id], onDelete: SetNull)
+  matchExceptions InvoiceMatchException[]
+  allocations     PaymentAllocation[]
+  lineItems       InvoiceLineItem[]
+  payments        Payment[]
+  budgetEntries   BudgetEntry[]
 
   @@unique([organizationId, invoiceNumber])
   // Guards against the same vendor invoice being entered twice.
@@ -1093,26 +1774,93 @@ model Invoice {
   @@index([organizationId, status])
   @@index([vendorId])
   @@index([dueDate])
+  @@index([purchaseOrderId])
+  @@index([goodsReceiptId])
+  @@index([organizationId, matchStatus])
+  @@index([approvedById])
+  @@index([costCenterId])
 }
 
 model InvoiceLineItem {
-  id           String  @id @default(cuid())
+  id           String   @id @default(cuid())
   invoiceId    String
   poLineItemId String?
   itemName     String
   description  String?
-  quantity     Float
-  unit         String  @default("unit")
-  unitPrice    Float
-  taxRate      Float   @default(0)
-  sortOrder    Int     @default(0)
+  quantity     Decimal  @db.Decimal(18, 4)
+  unit         String   @default("unit")
+  unitPrice    Decimal  @db.Decimal(18, 4)
+  taxRate      Decimal  @default(0) @db.Decimal(9, 4)
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @default(now()) @updatedAt
 
-  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  invoice    Invoice                 @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  poLineItem POLineItem?             @relation(fields: [poLineItemId], references: [id], onDelete: SetNull)
+  exceptions InvoiceMatchException[]
 
   @@index([invoiceId])
+  @@index([poLineItemId])
 }
 
 // ===========================================================================
+enum MatchExceptionType {
+  PRICE_VARIANCE
+  QUANTITY_VARIANCE
+  OVER_INVOICED
+  NOT_RECEIVED
+  NO_PO_LINE
+  DUPLICATE
+  TAX_VARIANCE
+  CURRENCY_MISMATCH
+}
+
+enum MatchExceptionStatus {
+  OPEN
+  ACCEPTED
+  DISPUTED
+  RESOLVED
+}
+
+// One line-level failure of the three-way match. The invoice keeps a headline
+// matchStatus; these rows are the evidence behind it — what was ordered, what
+// was received, what was billed, and by how much they differ.
+model InvoiceMatchException {
+  id             String               @id @default(cuid())
+  organizationId String
+  invoiceId      String
+  invoiceLineId  String?
+  poLineItemId   String?
+  type           MatchExceptionType
+  status         MatchExceptionStatus @default(OPEN)
+  orderedQty     Decimal?             @db.Decimal(18, 4)
+  receivedQty    Decimal?             @db.Decimal(18, 4)
+  invoicedQty    Decimal?             @db.Decimal(18, 4)
+  orderedPrice   Decimal?             @db.Decimal(18, 4)
+  invoicedPrice  Decimal?             @db.Decimal(18, 4)
+  variance       Decimal?             @db.Decimal(18, 4)
+  variancePct    Float?
+  // The tolerance in force when the match ran, so a later policy change does not
+  // silently reinterpret an old exception.
+  tolerancePct   Float?
+  detail         String?
+  resolvedById   String?
+  resolvedAt     DateTime?
+  resolutionNote String?
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @default(now()) @updatedAt
+
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  invoice      Invoice          @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  invoiceLine  InvoiceLineItem? @relation(fields: [invoiceLineId], references: [id], onDelete: Cascade)
+  resolvedBy   User?            @relation(fields: [resolvedById], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, status])
+  @@index([invoiceId])
+  @@index([invoiceLineId])
+  @@index([resolvedById])
+}
+
 // PAYMENTS
 // ===========================================================================
 
@@ -1142,19 +1890,19 @@ model Payment {
   paymentNumber  String
   invoiceId      String
   vendorId       String
-  amount         Float
+  amount         Decimal       @db.Decimal(18, 4)
   currency       String        @default("USD")
   method         PaymentMethod @default(BANK_TRANSFER)
   status         PaymentStatus @default(DRAFT)
 
-  scheduledFor   DateTime?
-  paymentDate    DateTime?
-  reference      String?
-  notes          String?
+  scheduledFor DateTime?
+  paymentDate  DateTime?
+  reference    String?
+  notes        String?
 
   // Finance approval gate — a payment cannot leave PENDING_APPROVAL without this.
-  approvedById   String?
-  approvedAt     DateTime?
+  approvedById String?
+  approvedAt   DateTime?
 
   // Seam for a future payment provider. Deliberately inert: no provider is
   // implemented, and nothing in the app claims one is connected.
@@ -1163,27 +1911,82 @@ model Payment {
   providerStatus String?
   failureReason  String?
 
-  reconciledAt   DateTime?
-  reconciledById String?
+  reconciledAt      DateTime?
+  reconciledById    String?
+  reconciledAmount  Decimal?  @db.Decimal(18, 4)
+  reconciliationRef String?
 
-  processedById  String
-  createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt
+  processedById String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
-  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  invoice      Invoice       @relation(fields: [invoiceId], references: [id])
-  vendor       Vendor        @relation(fields: [vendorId], references: [id])
-  processedBy  User          @relation(fields: [processedById], references: [id])
+  organization  Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  invoice       Invoice              @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  vendor        Vendor               @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  processedBy   User                 @relation(fields: [processedById], references: [id], onDelete: Restrict)
   budgetEntries BudgetEntry[]
+  allocations   PaymentAllocation[]
+  transactions  PaymentTransaction[]
 
   @@unique([organizationId, paymentNumber])
   @@index([organizationId])
   @@index([organizationId, status])
   @@index([invoiceId])
   @@index([vendorId])
+  @@index([processedById])
 }
 
 // ===========================================================================
+// How a payment is split across invoices. A payment keeps invoiceId for the
+// common single-invoice case; the allocations are what invoice balances are
+// derived from, so one consolidated payment settles five invoices by the right
+// amount each rather than by a guess.
+model PaymentAllocation {
+  id             String   @id @default(cuid())
+  organizationId String
+  paymentId      String
+  invoiceId      String
+  vendorId       String
+  amount         Decimal  @db.Decimal(18, 4)
+  currency       String   @default("USD")
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  payment      Payment      @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  invoice      Invoice      @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  vendor       Vendor       @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+
+  @@unique([paymentId, invoiceId])
+  @@index([organizationId])
+  @@index([invoiceId])
+  @@index([vendorId])
+}
+
+// Every attempt to move the money, including the failures. This is the seam a
+// payment provider plugs into. No provider is implemented; the table records
+// that honestly rather than pretending otherwise.
+model PaymentTransaction {
+  id              String        @id @default(cuid())
+  paymentId       String
+  attempt         Int           @default(1)
+  status          PaymentStatus
+  provider        String?
+  providerRef     String?
+  amount          Decimal       @db.Decimal(18, 4)
+  currency        String        @default("USD")
+  // Provider envelopes, credential-redacted before storage.
+  requestPayload  Json?
+  responsePayload Json?
+  errorCode       String?
+  errorMessage    String?
+  occurredAt      DateTime      @default(now())
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@unique([paymentId, attempt])
+  @@index([paymentId])
+}
+
 // BUDGETS
 // ===========================================================================
 
@@ -1198,41 +2001,56 @@ model Budget {
   id             String       @id @default(cuid())
   organizationId String
   departmentId   String
+  costCenterId   String?
+  name           String?
+  ownerId        String?
   fiscalYear     Int
   fiscalQuarter  Int?
-  totalAmount    Float
+  totalAmount    Decimal      @db.Decimal(18, 4)
   currency       String       @default("USD")
   status         BudgetStatus @default(ACTIVE)
 
   // Denormalised rollups of BudgetEntry, maintained transactionally.
-  reservedAmount  Float       @default(0)
-  committedAmount Float       @default(0)
-  spentAmount     Float       @default(0)
-  remainingAmount Float       @default(0)
+  reservedAmount  Decimal @default(0) @db.Decimal(18, 4)
+  committedAmount Decimal @default(0) @db.Decimal(18, 4)
+  // The full chain, each figure backed by BudgetEntry rows of the matching type:
+  //   requested -> reserved -> committed -> invoiced (spent) -> paid
+  requestedAmount Decimal @default(0) @db.Decimal(18, 4)
+  spentAmount     Decimal @default(0) @db.Decimal(18, 4)
+  invoicedAmount  Decimal @default(0) @db.Decimal(18, 4)
+  paidAmount      Decimal @default(0) @db.Decimal(18, 4)
+  remainingAmount Decimal @default(0) @db.Decimal(18, 4)
 
   // Hard stop: reject commitments that would exceed the budget.
-  enforceHardLimit Boolean    @default(false)
+  enforceHardLimit Boolean @default(false)
 
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  department   Department       @relation(fields: [departmentId], references: [id])
-  categories   BudgetCategory[]
-  alerts       BudgetAlert[]
-  entries      BudgetEntry[]
+  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  department     Department        @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+  costCenter     CostCenter?       @relation(fields: [costCenterId], references: [id], onDelete: SetNull)
+  requests       PurchaseRequest[]
+  purchaseOrders PurchaseOrder[]
+  categories     BudgetCategory[]
+  alerts         BudgetAlert[]
+  entries        BudgetEntry[]
 
   @@unique([organizationId, departmentId, fiscalYear, fiscalQuarter])
   @@index([organizationId])
+  @@index([departmentId])
+  @@index([costCenterId])
 }
 
 model BudgetCategory {
-  id        String @id @default(cuid())
+  id        String   @id @default(cuid())
   budgetId  String
   name      String
-  allocated Float  @default(0)
-  spent     Float  @default(0)
-  committed Float  @default(0)
+  allocated Decimal  @default(0) @db.Decimal(18, 4)
+  spent     Decimal  @default(0) @db.Decimal(18, 4)
+  committed Decimal  @default(0) @db.Decimal(18, 4)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
 
   budget Budget @relation(fields: [budgetId], references: [id], onDelete: Cascade)
 
@@ -1246,16 +2064,28 @@ model BudgetAlert {
   threshold   Float
   triggered   Boolean   @default(false)
   triggeredAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @default(now()) @updatedAt
 
   budget Budget @relation(fields: [budgetId], references: [id], onDelete: Cascade)
 
   @@index([budgetId])
 }
 
+// Ledger movement types. Together they reconstruct every rollup on the budget:
+//
+//   REQUESTED  request submitted        demand signal, not yet a claim
+//   RESERVED   request approved         claim on the budget
+//   COMMITTED  PO issued                contractual obligation
+//   SPENT      invoice approved         liability recognised
+//   PAID       payment completed        cash out
+//   RELEASED   cancelled or rejected    negates an earlier claim
 enum BudgetEntryType {
+  REQUESTED
   RESERVED
   COMMITTED
   SPENT
+  PAID
   RELEASED
 }
 
@@ -1263,28 +2093,33 @@ enum BudgetEntryType {
 // approved → ordered → invoiced → paid writes a row here, so the budget
 // figures are always reconstructable rather than merely asserted.
 model BudgetEntry {
-  id         String          @id @default(cuid())
-  budgetId   String
-  type       BudgetEntryType
-  amount     Float
-  categoryName String?
-  requestId  String?
+  id              String          @id @default(cuid())
+  budgetId        String
+  type            BudgetEntryType
+  amount          Decimal         @db.Decimal(18, 4)
+  categoryName    String?
+  costCenterId    String?
+  currency        String          @default("USD")
+  requestId       String?
   purchaseOrderId String?
-  invoiceId  String?
-  paymentId  String?
-  description String?
-  createdById String?
-  createdAt  DateTime        @default(now())
+  invoiceId       String?
+  paymentId       String?
+  description     String?
+  createdById     String?
+  createdAt       DateTime        @default(now())
 
   budget        Budget           @relation(fields: [budgetId], references: [id], onDelete: Cascade)
-  request       PurchaseRequest? @relation(fields: [requestId], references: [id])
-  purchaseOrder PurchaseOrder?   @relation(fields: [purchaseOrderId], references: [id])
-  invoice       Invoice?         @relation(fields: [invoiceId], references: [id])
-  payment       Payment?         @relation(fields: [paymentId], references: [id])
+  request       PurchaseRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  purchaseOrder PurchaseOrder?   @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
+  invoice       Invoice?         @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  payment       Payment?         @relation(fields: [paymentId], references: [id], onDelete: SetNull)
 
   @@index([budgetId])
   @@index([requestId])
   @@index([purchaseOrderId])
+  @@index([invoiceId])
+  @@index([paymentId])
+  @@index([budgetId, type])
 }
 
 // ===========================================================================
@@ -1302,35 +2137,42 @@ enum ContractStatus {
 }
 
 model Contract {
-  id             String         @id @default(cuid())
-  organizationId String
-  contractNumber String
-  title          String
-  vendorId       String
-  status         ContractStatus @default(DRAFT)
-  startDate      DateTime
-  endDate        DateTime
-  value          Float          @default(0)
-  currency       String         @default("USD")
-  autoRenew      Boolean        @default(false)
-  renewalNoticeDays Int         @default(30)
+  id                 String         @id @default(cuid())
+  organizationId     String
+  contractNumber     String
+  title              String
+  vendorId           String
+  status             ContractStatus @default(DRAFT)
+  departmentId       String?
+  categoryId         String?
+  ownerId            String?
+  // Contract type drives which obligations and renewal rules apply.
+  contractType       ContractType   @default(PURCHASE)
+  startDate          DateTime
+  endDate            DateTime
+  value              Decimal        @default(0) @db.Decimal(18, 4)
+  currency           String         @default("USD")
+  autoRenew          Boolean        @default(false)
+  renewalNoticeDays  Int            @default(30)
   renewalAlertSentAt DateTime?
-  slaTerms       String?
-  description    String?
+  slaTerms           String?
+  description        String?
   // JSON string array.
-  tags           String?
-  version        Int            @default(1)
-  renewedFromId  String?
-  terminatedAt   DateTime?
-  terminatedReason String?
-  createdById    String?
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
+  tags               String?
+  version            Int            @default(1)
+  renewedFromId      String?
+  terminatedAt       DateTime?
+  terminatedReason   String?
+  createdById        String?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
 
-  organization Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  vendor       Vendor               @relation(fields: [vendorId], references: [id])
-  versions     ContractVersion[]
-  obligations  ContractObligation[]
+  organization   Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  vendor         Vendor               @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  department     Department?          @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  categoryRef    ProcurementCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  versions       ContractVersion[]
+  obligations    ContractObligation[]
   purchaseOrders PurchaseOrder[]
 
   @@unique([organizationId, contractNumber])
@@ -1338,6 +2180,8 @@ model Contract {
   @@index([organizationId, status])
   @@index([vendorId])
   @@index([endDate])
+  @@index([departmentId])
+  @@index([categoryId])
 }
 
 model ContractVersion {
@@ -1371,6 +2215,7 @@ model ContractObligation {
   ownerId     String?
   notes       String?
   createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @default(now()) @updatedAt
 
   contract Contract @relation(fields: [contractId], references: [id], onDelete: Cascade)
 
@@ -1379,6 +2224,22 @@ model ContractObligation {
 }
 
 // ===========================================================================
+enum DepreciationMethod {
+  NONE
+  STRAIGHT_LINE
+  REDUCING_BALANCE
+}
+
+enum ContractType {
+  PURCHASE
+  SERVICE
+  FRAMEWORK
+  LEASE
+  SLA
+  NDA
+  OTHER
+}
+
 // ASSETS
 // ===========================================================================
 
@@ -1403,43 +2264,49 @@ enum AssetCategory {
 }
 
 model Asset {
-  id             String        @id @default(cuid())
-  organizationId String
-  assetTag       String
-  name           String
-  category       AssetCategory @default(OTHER)
-  serialNumber   String?
-  purchaseOrderId String?
-  goodsReceiptId String?
-  vendorId       String?
-  assignedToId   String?
-  departmentId   String?
-  branchId       String?
-  location       String?
-  status         AssetStatus   @default(IN_STORAGE)
+  id                 String        @id @default(cuid())
+  organizationId     String
+  assetTag           String
+  name               String
+  category           AssetCategory @default(OTHER)
+  serialNumber       String?
+  purchaseOrderId    String?
+  goodsReceiptId     String?
+  goodsReceiptItemId String?
+  poLineItemId       String?
+  vendorId           String?
+  assignedToId       String?
+  departmentId       String?
+  branchId           String?
+  location           String?
+  status             AssetStatus   @default(IN_STORAGE)
 
-  purchaseDate   DateTime?
-  purchaseValue  Float         @default(0)
-  currentValue   Float         @default(0)
-  currency       String        @default("USD")
-  depreciationRate Float       @default(0)
-  warrantyExpiry DateTime?
+  purchaseDate       DateTime?
+  purchaseValue      Decimal            @default(0) @db.Decimal(18, 4)
+  currentValue       Decimal            @default(0) @db.Decimal(18, 4)
+  currency           String             @default("USD")
+  depreciationRate   Decimal            @default(0) @db.Decimal(9, 4)
+  depreciationMethod DepreciationMethod @default(STRAIGHT_LINE)
+  usefulLifeMonths   Int?
+  salvageValue       Decimal            @default(0) @db.Decimal(18, 4)
+  warrantyExpiry     DateTime?
 
   qrCode         String?
   notes          String?
   retiredAt      DateTime?
   disposedAt     DateTime?
   disposalReason String?
-  createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
-  organization  Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  purchaseOrder PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
-  goodsReceipt  GoodsReceipt?  @relation(fields: [goodsReceiptId], references: [id])
-  vendor        Vendor?        @relation(fields: [vendorId], references: [id])
-  assignedTo    User?          @relation("AssetAssignee", fields: [assignedToId], references: [id])
-  department    Department?    @relation(fields: [departmentId], references: [id])
-  branch        Branch?        @relation(fields: [branchId], references: [id])
+  organization     Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  purchaseOrder    PurchaseOrder?    @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
+  goodsReceipt     GoodsReceipt?     @relation(fields: [goodsReceiptId], references: [id], onDelete: SetNull)
+  goodsReceiptItem GoodsReceiptItem? @relation(fields: [goodsReceiptItemId], references: [id], onDelete: SetNull)
+  vendor           Vendor?           @relation(fields: [vendorId], references: [id], onDelete: SetNull)
+  assignedTo       User?             @relation("AssetAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  department       Department?       @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  branch           Branch?           @relation(fields: [branchId], references: [id], onDelete: SetNull)
 
   maintenanceRecords AssetMaintenance[]
   transfers          AssetTransfer[]
@@ -1448,6 +2315,12 @@ model Asset {
   @@index([organizationId])
   @@index([organizationId, status])
   @@index([assignedToId])
+  @@index([goodsReceiptId])
+  @@index([purchaseOrderId])
+  @@index([departmentId])
+  @@index([goodsReceiptItemId])
+  @@index([vendorId])
+  @@index([branchId])
 }
 
 enum MaintenanceType {
@@ -1462,7 +2335,7 @@ model AssetMaintenance {
   assetId     String
   type        MaintenanceType
   description String
-  cost        Float           @default(0)
+  cost        Decimal         @default(0) @db.Decimal(18, 4)
   performedBy String?
   date        DateTime        @default(now())
   nextDueDate DateTime?
@@ -1503,63 +2376,137 @@ enum StockMovementType {
 }
 
 model InventoryItem {
-  id             String   @id @default(cuid())
-  organizationId String
-  sku            String
-  name           String
-  description    String?
-  category       String?
-  unit           String   @default("unit")
-  quantity       Float    @default(0)
-  reorderLevel   Float    @default(0)
-  reorderQty     Float    @default(0)
-  unitCost       Float    @default(0)
-  currency       String   @default("USD")
-  location       String?
-  binLocation    String?
-  lastRestockDate DateTime?
-  supplierId     String?
+  id                 String    @id @default(cuid())
+  organizationId     String
+  sku                String
+  name               String
+  description        String?
+  category           String?
+  unit               String    @default("unit")
+  quantity           Decimal   @default(0) @db.Decimal(18, 4)
+  reorderLevel       Decimal   @default(0) @db.Decimal(18, 4)
+  reorderQty         Decimal   @default(0) @db.Decimal(18, 4)
+  unitCost           Decimal   @default(0) @db.Decimal(18, 4)
+  currency           String    @default("USD")
+  location           String?
+  defaultWarehouseId String?
+  barcode            String?
+  isActive           Boolean   @default(true)
+  binLocation        String?
+  lastRestockDate    DateTime?
+  supplierId         String?
   reorderAlertSentAt DateTime?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
 
-  organization Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  supplier     Vendor?         @relation(fields: [supplierId], references: [id])
-  movements    StockMovement[]
-  poLineItems  POLineItem[]
+  organization     Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  supplier         Vendor?         @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  defaultWarehouse Warehouse?      @relation("ItemDefaultWarehouse", fields: [defaultWarehouseId], references: [id], onDelete: SetNull)
+  balances         StockBalance[]
+  movements        StockMovement[]
+  poLineItems      POLineItem[]
 
   @@unique([organizationId, sku])
   @@index([organizationId])
+  @@index([supplierId])
+  @@index([defaultWarehouseId])
 }
 
 // Append-only stock ledger. `balanceAfter` is written inside the same transaction
 // as the item quantity update, so the ledger and the item can never disagree.
 model StockMovement {
-  id           String            @id @default(cuid())
-  itemId       String
-  type         StockMovementType
-  quantity     Float
-  balanceAfter Float
-  unitCost     Float?
-  reference    String?
-  purchaseOrderId String?
-  goodsReceiptId String?
-  fromLocation String?
-  toLocation   String?
-  notes        String?
-  performedById String
-  createdAt    DateTime          @default(now())
+  id                 String            @id @default(cuid())
+  itemId             String
+  type               StockMovementType
+  quantity           Decimal           @db.Decimal(18, 4)
+  balanceAfter       Decimal           @db.Decimal(18, 4)
+  unitCost           Decimal?          @db.Decimal(18, 4)
+  reference          String?
+  purchaseOrderId    String?
+  goodsReceiptId     String?
+  warehouseId        String?
+  fromWarehouseId    String?
+  toWarehouseId      String?
+  goodsReceiptItemId String?
+  fromLocation       String?
+  toLocation         String?
+  notes              String?
+  performedById      String
+  createdAt          DateTime          @default(now())
 
   item          InventoryItem  @relation(fields: [itemId], references: [id], onDelete: Cascade)
-  purchaseOrder PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
-  goodsReceipt  GoodsReceipt?  @relation(fields: [goodsReceiptId], references: [id])
-  performedBy   User           @relation(fields: [performedById], references: [id])
+  purchaseOrder PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
+  goodsReceipt  GoodsReceipt?  @relation(fields: [goodsReceiptId], references: [id], onDelete: SetNull)
+  performedBy   User           @relation(fields: [performedById], references: [id], onDelete: Restrict)
+  warehouse     Warehouse?     @relation("MovementWarehouse", fields: [warehouseId], references: [id], onDelete: SetNull)
+  fromWarehouse Warehouse?     @relation("MovementFromWarehouse", fields: [fromWarehouseId], references: [id], onDelete: SetNull)
+  toWarehouse   Warehouse?     @relation("MovementToWarehouse", fields: [toWarehouseId], references: [id], onDelete: SetNull)
 
   @@index([itemId])
   @@index([goodsReceiptId])
+  @@index([warehouseId])
+  @@index([itemId, createdAt])
+  @@index([purchaseOrderId])
+  @@index([performedById])
+  @@index([fromWarehouseId])
+  @@index([toWarehouseId])
 }
 
 // ===========================================================================
+// A stocking location. Inventory is held per warehouse, not per organization, so
+// "we have 40 in Lagos and none in Abuja" is answerable from the data.
+model Warehouse {
+  id             String   @id @default(cuid())
+  organizationId String
+  branchId       String?
+  code           String
+  name           String
+  address        String?
+  managerId      String?
+  isDefault      Boolean  @default(false)
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now()) @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branch       Branch?      @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  manager      User?        @relation(fields: [managerId], references: [id], onDelete: SetNull)
+
+  balances        StockBalance[]
+  defaultForItems InventoryItem[]    @relation("ItemDefaultWarehouse")
+  movements       StockMovement[]    @relation("MovementWarehouse")
+  movementsFrom   StockMovement[]    @relation("MovementFromWarehouse")
+  movementsTo     StockMovement[]    @relation("MovementToWarehouse")
+  goodsReceipts   GoodsReceipt[]
+  receiptItems    GoodsReceiptItem[]
+  poLineItems     POLineItem[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+  @@index([branchId])
+  @@index([managerId])
+}
+
+// Per-item, per-warehouse quantity. The item-level `quantity` is the sum of these
+// and is maintained in the same transaction as the movement that changed it, so
+// the ledger, the balances and the item total can never disagree.
+model StockBalance {
+  id          String   @id @default(cuid())
+  itemId      String
+  warehouseId String
+  quantity    Decimal  @default(0) @db.Decimal(18, 4)
+  // Committed to an internal issue but not yet picked.
+  reservedQty Decimal  @default(0) @db.Decimal(18, 4)
+  binLocation String?
+  updatedAt   DateTime @default(now()) @updatedAt
+
+  item      InventoryItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  warehouse Warehouse     @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, warehouseId])
+  @@index([warehouseId])
+}
+
 // DOCUMENTS & FILE STORAGE
 // ===========================================================================
 
@@ -1579,27 +2526,36 @@ enum DocumentEntityType {
   REQUEST
   PO
   RFQ
+  QUOTATION
   VENDOR
   CONTRACT
   INVOICE
+  PAYMENT
   ASSET
   GOODS_RECEIPT
+  BUDGET
+  DEPARTMENT
 }
 
 // The actual bytes. Separated from DocumentRecord so that a document can carry
 // many versions, and so attachments elsewhere can reference storage without
 // becoming library documents.
 model StoredFile {
-  id           String   @id @default(cuid())
+  id             String          @id @default(cuid())
   organizationId String
-  storageKey   String   @unique
-  originalName String
-  mimeType     String
-  sizeBytes    Int
-  checksum     String?
-  uploadedById String
-  createdAt    DateTime @default(now())
+  storageKey     String          @unique
+  originalName   String
+  mimeType       String
+  sizeBytes      Int
+  checksum       String?
+  // Where the bytes live. LOCAL is the filesystem root in FILE_STORAGE_ROOT;
+  // SUPABASE is a Supabase Storage bucket, which is what serverless deploys use.
+  provider       StorageProvider @default(LOCAL)
+  bucket         String?
+  uploadedById   String
+  createdAt      DateTime        @default(now())
 
+  organization     Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   documentVersions DocumentVersion[]
   vendorDocuments  VendorDocument[]
 
@@ -1607,31 +2563,33 @@ model StoredFile {
 }
 
 model DocumentRecord {
-  id             String              @id @default(cuid())
-  organizationId String
-  name           String
-  category       DocumentCategory    @default(OTHER)
-  description    String?
+  id                String              @id @default(cuid())
+  organizationId    String
+  name              String
+  category          DocumentCategory    @default(OTHER)
+  description       String?
   // JSON string array.
-  tags           String?
-  linkedEntityType DocumentEntityType?
-  linkedEntityId String?
-  currentVersion Int                 @default(1)
-  expiresAt      DateTime?
+  tags              String?
+  linkedEntityType  DocumentEntityType?
+  linkedEntityId    String?
+  currentVersion    Int                 @default(1)
+  expiresAt         DateTime?
   // JSON array of UserRole literals permitted to read; null means org-wide.
   restrictedToRoles String?
-  uploadedById   String
-  createdAt      DateTime            @default(now())
-  updatedAt      DateTime            @updatedAt
+  uploadedById      String
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
 
-  organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  uploadedBy   User              @relation(fields: [uploadedById], references: [id])
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  uploadedBy   User                @relation(fields: [uploadedById], references: [id], onDelete: Restrict)
   versions     DocumentVersion[]
   accessLogs   DocumentAccessLog[]
+  links        DocumentLink[]
 
   @@index([organizationId])
   @@index([linkedEntityType, linkedEntityId])
   @@index([expiresAt])
+  @@index([uploadedById])
 }
 
 model DocumentVersion {
@@ -1645,20 +2603,21 @@ model DocumentVersion {
   uploadedAt   DateTime @default(now())
 
   document   DocumentRecord @relation(fields: [documentId], references: [id], onDelete: Cascade)
-  storedFile StoredFile?    @relation(fields: [storedFileId], references: [id])
+  storedFile StoredFile?    @relation(fields: [storedFileId], references: [id], onDelete: SetNull)
 
   @@unique([documentId, version])
   @@index([documentId])
+  @@index([storedFileId])
 }
 
 model DocumentAccessLog {
-  id         String   @id @default(cuid())
-  documentId String
-  userId     String?
+  id             String   @id @default(cuid())
+  documentId     String
+  userId         String?
   supplierUserId String?
-  action     String
-  ipAddress  String?
-  createdAt  DateTime @default(now())
+  action         String
+  ipAddress      String?
+  createdAt      DateTime @default(now())
 
   document DocumentRecord @relation(fields: [documentId], references: [id], onDelete: Cascade)
 
@@ -1666,6 +2625,38 @@ model DocumentAccessLog {
 }
 
 // ===========================================================================
+enum StorageProvider {
+  LOCAL
+  SUPABASE
+}
+
+// A document attached to a record. One document may be attached to many records —
+// a supplier certificate that justifies an award, is referenced by the contract,
+// and is filed against the vendor — which a single foreign key cannot express.
+// DocumentRecord keeps its own `linkedEntity*` columns as the document's primary
+// home; these rows are the additional attachments.
+model DocumentLink {
+  id             String             @id @default(cuid())
+  organizationId String
+  documentId     String
+  entityType     DocumentEntityType
+  entityId       String
+  // What the attachment is for on this particular record: proof of delivery,
+  // signed copy, supporting quote.
+  purpose        String?
+  linkedById     String?
+  createdAt      DateTime           @default(now())
+
+  organization Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  document     DocumentRecord @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  linkedBy     User?          @relation(fields: [linkedById], references: [id], onDelete: SetNull)
+
+  @@unique([documentId, entityType, entityId])
+  @@index([organizationId])
+  @@index([entityType, entityId])
+  @@index([linkedById])
+}
+
 // ACTIVITY, AUDIT, NOTIFICATIONS
 // ===========================================================================
 
@@ -1677,31 +2668,33 @@ enum Severity {
 }
 
 model ActivityLog {
-  id             String   @id @default(cuid())
-  organizationId String
-  userId         String?
-  requestId      String?
+  id              String   @id @default(cuid())
+  organizationId  String
+  userId          String?
+  requestId       String?
   purchaseOrderId String?
-  rfqId          String?
-  vendorId       String?
-  eventType      String
-  description    String
-  severity       Severity @default(INFO)
-  ipAddress      String?
-  userAgent      String?
+  rfqId           String?
+  vendorId        String?
+  eventType       String
+  description     String
+  severity        Severity @default(INFO)
+  ipAddress       String?
+  userAgent       String?
   // JSON blob.
-  metadata       String?
-  createdAt      DateTime @default(now())
+  metadata        Json?
+  createdAt       DateTime @default(now())
 
   organization  Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  user          User?            @relation(fields: [userId], references: [id])
-  request       PurchaseRequest? @relation(fields: [requestId], references: [id])
-  purchaseOrder PurchaseOrder?   @relation(fields: [purchaseOrderId], references: [id])
-  rfq           RFQ?             @relation(fields: [rfqId], references: [id])
+  user          User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+  request       PurchaseRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  purchaseOrder PurchaseOrder?   @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
+  rfq           RFQ?             @relation(fields: [rfqId], references: [id], onDelete: SetNull)
 
   @@index([organizationId, createdAt])
   @@index([requestId])
   @@index([userId])
+  @@index([purchaseOrderId])
+  @@index([rfqId])
 }
 
 // Append-only. There is no update or delete path to this table anywhere in the
@@ -1715,14 +2708,18 @@ model AuditLogEntry {
   resource       String
   resourceId     String?
   // JSON snapshots captured server-side, never supplied by the client.
-  before         String?
-  after          String?
+  // Server-captured snapshots, stored as jsonb so audit queries can filter on
+  // what actually changed rather than string-matching a blob.
+  before         Json?
+  after          Json?
+  // Field names that differ between before and after.
+  changedFields  String[]
   ipAddress      String?
   userAgent      String?
   createdAt      DateTime @default(now())
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  user         User?        @relation(fields: [userId], references: [id])
+  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   @@index([organizationId, createdAt])
   @@index([resource, resourceId])
@@ -1753,6 +2750,7 @@ model Notification {
   entityType     String?
   entityId       String?
   createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @default(now()) @updatedAt
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -1765,22 +2763,22 @@ model NotificationPreference {
   id     String @id @default(cuid())
   userId String @unique
 
-  channelInApp  Boolean @default(true)
-  channelEmail  Boolean @default(true)
-  channelPush   Boolean @default(false)
-  channelSlack  Boolean @default(false)
-  channelTeams  Boolean @default(false)
+  channelInApp    Boolean @default(true)
+  channelEmail    Boolean @default(true)
+  channelPush     Boolean @default(false)
+  channelSlack    Boolean @default(false)
+  channelTeams    Boolean @default(false)
   channelWhatsapp Boolean @default(false)
-  channelSms    Boolean @default(false)
+  channelSms      Boolean @default(false)
 
-  catApprovals     Boolean @default(true)
-  catRequests      Boolean @default(true)
-  catRfqs          Boolean @default(true)
+  catApprovals      Boolean @default(true)
+  catRequests       Boolean @default(true)
+  catRfqs           Boolean @default(true)
   catPurchaseOrders Boolean @default(true)
-  catBudgetAlerts  Boolean @default(true)
-  catSlaWarnings   Boolean @default(true)
-  catMentions      Boolean @default(true)
-  catWeeklyDigest  Boolean @default(false)
+  catBudgetAlerts   Boolean @default(true)
+  catSlaWarnings    Boolean @default(true)
+  catMentions       Boolean @default(true)
+  catWeeklyDigest   Boolean @default(false)
 
   quietHoursStart String?
   quietHoursEnd   String?
@@ -1806,6 +2804,31 @@ model NotificationDelivery {
 }
 
 // ===========================================================================
+// Transactional outbox. Domain events are written here inside the same
+// transaction as the business change that caused them, then dispatched by a
+// drainer. Without this a notification can be sent for an approval that later
+// rolled back, or a committed approval can silently notify nobody.
+model EventOutbox {
+  id             String    @id @default(cuid())
+  organizationId String
+  type           String
+  entityType     String?
+  entityId       String?
+  payload        Json
+  status         String    @default("PENDING")
+  attempts       Int       @default(0)
+  availableAt    DateTime  @default(now())
+  processedAt    DateTime?
+  lastError      String?
+  createdAt      DateTime  @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([status, availableAt])
+  @@index([organizationId, createdAt])
+  @@index([entityType, entityId])
+}
+
 // INTEGRATIONS
 // ===========================================================================
 
@@ -1849,15 +2872,15 @@ model Integration {
   // JSON array of event keys this integration subscribes to.
   enabledEvents   String?
 
-  lastSyncAt      DateTime?
-  lastSyncStatus  String?
-  lastError       String?
-  configuredById  String?
-  configuredAt    DateTime?
-  createdAt       DateTime          @default(now())
-  updatedAt       DateTime          @updatedAt
+  lastSyncAt     DateTime?
+  lastSyncStatus String?
+  lastError      String?
+  configuredById String?
+  configuredAt   DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
-  organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   logs         IntegrationLog[]
 
   @@unique([organizationId, type])
@@ -1886,7 +2909,7 @@ model WebhookDelivery {
   integrationId  String?
   url            String
   event          String
-  payload        String
+  payload        Json
   status         String    @default("PENDING")
   attempts       Int       @default(0)
   maxAttempts    Int       @default(5)
@@ -1934,14 +2957,14 @@ model SavedView {
 }
 
 model AIConversation {
-  id        String   @id @default(cuid())
+  id             String   @id @default(cuid())
   organizationId String
-  userId    String
-  title     String?
-  entityType String?
-  entityId  String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  userId         String
+  title          String?
+  entityType     String?
+  entityId       String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
   user     User        @relation(fields: [userId], references: [id], onDelete: Cascade)
   messages AIMessage[]
@@ -1996,10 +3019,11 @@ model DigitalSignature {
   signedAt       DateTime            @default(now())
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  signer       User         @relation(fields: [signerId], references: [id])
+  signer       User         @relation(fields: [signerId], references: [id], onDelete: Restrict)
 
   @@index([entityType, entityId])
   @@index([organizationId])
+  @@index([signerId])
 }
 
 // ===========================================================================

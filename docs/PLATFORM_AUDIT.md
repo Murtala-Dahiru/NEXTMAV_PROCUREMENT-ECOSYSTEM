@@ -404,3 +404,115 @@ bootstrap. 37 API routes.
   and nothing claims otherwise.
 - **No scheduled jobs** for SLA escalation, RFQ expiry, invoice overdue flagging or
   contract renewal alerts. The functions exist; nothing calls them on a timer.
+
+---
+
+# Phase 1 — database, data architecture and procurement business logic
+
+**Date:** 2026-08-19
+**Database:** Supabase PostgreSQL 17 (`aws-1-eu-west-1`, Supavisor pooler)
+**Scope:** the foundation only. No UI redesign; UI changes limited to what the
+data layer required.
+
+## What was inspected first
+
+The schema described in "Implementation status" above did exist and was better
+than the audit's own headline suggested: 64 tables, a working tenancy guard, real
+sessions, an approval engine and a budget ledger. The gaps were not in whether
+tables existed but in whether the *business* was represented — and in three
+structural weaknesses that would have been expensive to fix later.
+
+## What changed, and why
+
+### Structural
+
+| Was | Now | Why it mattered |
+|---|---|---|
+| Money in `double precision` | `numeric(18,4)`, with a generated read-side extension keeping application types as `number` | Floating point cannot hold decimal money; a ledger of hundreds of entries drifts |
+| Permissions as a hardcoded map plus a JSON override column | `Role` · `RolePermission` · `UserRoleAssignment`, 14 system roles installed as data | §5: an organization must be able to add a role and permission it without a deploy |
+| Approvals only over purchase requests | `ApprovalInstance` over any entity, workflows versioned, stages targeting configured roles | §7: another organization must be able to configure a different process without code |
+| Status as a free column | `src/server/state-machine.ts`, eight lifecycles, every transition asserted | §6, §11: no arbitrary status changes |
+| Events emitted beside the transaction | `EventOutbox`, written inside it, drained after commit | §23: no notification for work that rolled back, and none lost after it commits |
+| `db push` | Three checked-in migrations applied with `migrate deploy` | §24: a database that cannot be recreated from migrations is not reproducible |
+
+### New to the model
+
+Cost centres · department hierarchy · warehouses and per-warehouse stock balances
+· procurement categories · vendor contacts, category qualifications, risk
+assessments and performance snapshots · RFQ evaluation criteria, per-criterion
+scores and award records · line-level invoice match exceptions · payment
+allocations and payment transactions · standing approval delegations · polymorphic
+document links · the transactional outbox.
+
+Request lifecycle gained `IN_PROCUREMENT`, `ORDERED`, `PARTIALLY_FULFILLED`,
+`FULFILLED`, `CLOSED` and `RETURNED`; purchase orders gained `APPROVED` and
+`REJECTED` with a separation-of-duties gate; budgets gained the full
+requested → reserved → committed → invoiced → paid chain.
+
+### Integrity
+
+202 foreign keys, every one indexed and every one with an explicit delete policy;
+38 check constraints; 369 indexes. Row-level security enabled on all 84 tables so
+the browser-side Supabase key cannot read the database through PostgREST —
+confirmed by an actual request returning `permission denied`.
+
+## Two things the tests found
+
+1. **Prisma's 5-second interactive transaction budget is wrong for a pooled
+   remote database.** Posting a receipt writes stock movements, balances and one
+   asset row per unit, each paying a round trip; the budget ran out mid-transaction
+   and the work rolled back as "Transaction not found". Raised to 30 seconds.
+2. **A composite unique containing a nullable column is not a uniqueness
+   guarantee.** Two NULLs never collide in Postgres, so an upsert keyed on
+   `(userId, roleId, departmentId)` created a duplicate grant on every
+   organization-wide role assignment. Replaced with an explicit find-then-write.
+3. **The seed asserted budget figures with no ledger behind them.** Three of the
+   four demo budgets showed six-figure spend against an empty `BudgetEntry`
+   table — precisely the "asserted rather than reconstructable" state the ledger
+   exists to prevent, sitting in the data the platform boots with. The seed now
+   writes opening-balance entries and derives the rollups from them; all four
+   budgets reconcile.
+4. **`connection_limit=1` is a serverless setting, not a universal one.** Carried
+   over from the Supabase docs, it serialised every request in a long-running
+   server behind a single connection; responses took 10–20 seconds and the journey
+   suite looked hung. Raised to 10 for the server case, with the serverless case
+   documented next to it.
+
+## Verification
+
+| Suite | Checks | Result |
+|---|---|---|
+| `typecheck` | — | 0 errors |
+| `verify:tenancy` | 8 | cross-tenant read, update and delete all blocked |
+| `verify:scenarios` | 59 | the eight scenarios of §26, against Supabase |
+| `verify:lifecycle` | 26 | transition tables and the revision path, over real HTTP |
+| `verify:journeys` | 72 | full P2P lifecycle over real HTTP |
+
+`verify:scenarios` and `verify:lifecycle` are new. The first runs the mandate's
+eight scenarios in a throwaway tenant against the real database, asserts on what
+was actually stored, and tears the tenant down. The second exercises the
+transitions no other suite reaches — the revision path, and the moves that must be
+refused — and it found two defects worth recording:
+
+- **A returned request could not be resubmitted.** The state machine allowed
+  `RETURNED → SUBMITTED`; the service still demanded `DRAFT`. Returning a request
+  for revision was therefore a dead end, which defeats the point of having the
+  state at all. The guard now asks the state machine instead of restating it.
+- **A request already under approval could be re-submitted**, silently discarding
+  decisions people had already made. `canTransition` treats a move to the status
+  you are already in as legal; the guard now uses `nextStates`, which does not.
+
+## Deliberately not done in this phase
+
+- **The UI still reads `roleOverrides`.** The bootstrap payload now also sends the
+  full `roles` array; the roles screen should be moved onto it in the UI phase.
+- **No supplier-facing application.** Identity, sessions and isolation exist;
+  suppliers still cannot log in and quote for themselves.
+- **Vendor, contract, asset, inventory and document *writes*** still go through
+  local state in the client. Their reads are real; their mutations are not yet
+  server-backed.
+- **No file storage endpoint.** `StoredFile` now records a provider, and Supabase
+  Storage is the intended target for serverless deployments; nothing writes to it.
+- **No scheduled jobs.** SLA escalation, RFQ expiry, overdue invoice flagging,
+  contract renewal alerts and outbox retry all have functions and no timer.
+- **`/api/ai` is still unauthenticated** and trusts client-supplied context.

@@ -70,7 +70,7 @@ export async function bootstrap(ctx: ServiceContext) {
     supplierUsers,
     supplierActivities,
     notificationPreference,
-    roleOverrides,
+    roles,
     savedViews,
   ] = await Promise.all([
     db.organization.findUnique({ where: { id: organizationId } }),
@@ -140,7 +140,10 @@ export async function bootstrap(ctx: ServiceContext) {
       take: 200,
     }),
     db.notificationPreference.findUnique({ where: { userId: ctx.principal.userId } }),
-    tdb.rolePermissionOverride.findMany(),
+    tdb.role.findMany({
+      include: { permissions: { select: { permission: true } } },
+      orderBy: { rank: "desc" },
+    }),
     tdb.savedView.findMany({
       where: { OR: [{ userId: ctx.principal.userId }, { isShared: true }] },
     }),
@@ -297,7 +300,15 @@ export async function bootstrap(ctx: ServiceContext) {
       })),
       watchers: r.watchers.map((w) => w.userId),
       submittedAt: iso(r.submittedAt),
-      completedAt: iso(r.completedAt),
+      approvedAt: iso(r.approvedAt),
+      orderedAt: iso(r.orderedAt),
+      fulfilledAt: iso(r.fulfilledAt),
+      // The UI reads completedAt; a request now completes when it closes.
+      completedAt: iso(r.closedAt),
+      closedAt: iso(r.closedAt),
+      returnedAt: iso(r.returnedAt),
+      returnReason: r.returnReason ?? undefined,
+      rejectionReason: r.rejectionReason ?? undefined,
       createdAt: isoReq(r.createdAt),
       updatedAt: isoReq(r.updatedAt),
       version: r.version,
@@ -745,8 +756,10 @@ export async function bootstrap(ctx: ServiceContext) {
       action: a.action,
       resource: a.resource,
       resourceId: a.resourceId ?? undefined,
-      before: a.before ? JSON.parse(a.before) : undefined,
-      after: a.after ? JSON.parse(a.after) : undefined,
+      // jsonb columns: already objects, not strings waiting to be parsed.
+      before: a.before ?? undefined,
+      after: a.after ?? undefined,
+      changedFields: a.changedFields,
       ipAddress: a.ipAddress ?? "",
       userAgent: a.userAgent ?? "",
       timestamp: isoReq(a.createdAt),
@@ -798,8 +811,27 @@ export async function bootstrap(ctx: ServiceContext) {
         }
       : null,
 
+    // The organization's configured roles, sent as data. The roles screen renders
+    // these rather than a hardcoded list, so a role an administrator invents shows
+    // up without a release.
+    roles: roles.map((r) => ({
+      id: r.id,
+      key: r.key,
+      name: r.name,
+      description: r.description ?? undefined,
+      rank: r.rank,
+      isSystem: r.isSystem,
+      isActive: r.isActive,
+      legacyRole: r.legacyRole ?? undefined,
+      permissions: r.permissions.map((p) => p.permission),
+    })),
+
+    // Kept for the roles screen, which is keyed on the legacy enum: the permission
+    // set each built-in role currently grants in this organization.
     roleOverrides: Object.fromEntries(
-      roleOverrides.map((r) => [r.role, parseArray(r.permissions)])
+      roles
+        .filter((r) => r.legacyRole)
+        .map((r) => [r.legacyRole as string, r.permissions.map((p) => p.permission)])
     ),
 
     savedViews: savedViews.map((s) => ({

@@ -9,14 +9,21 @@ export type UserRole =
   | "EMPLOYEE"
   | "AUDITOR";
 
+// Mirrors the RequestStatus enum in prisma/schema.prisma. The fulfilment states
+// after APPROVED are derived from receipts and payments, not chosen by a user.
 export type RequestStatus =
   | "DRAFT"
   | "SUBMITTED"
   | "UNDER_REVIEW"
   | "APPROVED"
+  | "RETURNED"
   | "REJECTED"
   | "CANCELLED"
-  | "COMPLETED";
+  | "IN_PROCUREMENT"
+  | "ORDERED"
+  | "PARTIALLY_FULFILLED"
+  | "FULFILLED"
+  | "CLOSED";
 
 export type Priority = "LOW" | "MEDIUM" | "HIGH" | "URGENT";
 
@@ -113,6 +120,29 @@ export type Permission =
   | "purchaseOrders.issue"
   | "purchaseOrders.cancel"
   | "purchaseOrders.updateStatus"
+  | "purchaseOrders.approve"
+  | "goodsReceipts.view"
+  | "goodsReceipts.create"
+  | "goodsReceipts.post"
+  | "invoices.view"
+  | "invoices.create"
+  | "invoices.match"
+  | "invoices.approve"
+  | "invoices.reject"
+  | "payments.view"
+  | "payments.create"
+  | "payments.approve"
+  | "payments.process"
+  | "payments.reconcile"
+  | "inventory.view"
+  | "inventory.manage"
+  | "assets.view"
+  | "assets.manage"
+  | "contracts.view"
+  | "contracts.manage"
+  | "documents.view"
+  | "documents.upload"
+  | "documents.delete"
   | "reports.view"
   | "reports.export"
   | "budgets.view"
@@ -151,6 +181,29 @@ export const PERMISSION_LABELS: Record<Permission, { label: string; category: st
   "purchaseOrders.issue": { label: "Issue Purchase Orders", category: "Purchase Orders", description: "Send POs to vendors" },
   "purchaseOrders.cancel": { label: "Cancel Purchase Orders", category: "Purchase Orders", description: "Cancel issued POs" },
   "purchaseOrders.updateStatus": { label: "Update PO Status", category: "Purchase Orders", description: "Update delivery status of POs" },
+  "purchaseOrders.approve": { label: "Approve Purchase Orders", category: "Purchase Orders", description: "Approve a PO before it is issued to the vendor" },
+  "goodsReceipts.view": { label: "View Goods Receipts", category: "Receiving", description: "View deliveries recorded against purchase orders" },
+  "goodsReceipts.create": { label: "Record Deliveries", category: "Receiving", description: "Record what a vendor actually delivered" },
+  "goodsReceipts.post": { label: "Post Receipts", category: "Receiving", description: "Post a receipt to stock and to the asset register" },
+  "invoices.view": { label: "View Invoices", category: "Invoices", description: "View vendor invoices" },
+  "invoices.create": { label: "Enter Invoices", category: "Invoices", description: "Enter or submit a vendor invoice" },
+  "invoices.match": { label: "Match Invoices", category: "Invoices", description: "Run and review the three-way match" },
+  "invoices.approve": { label: "Approve Invoices", category: "Invoices", description: "Approve an invoice for payment" },
+  "invoices.reject": { label: "Reject Invoices", category: "Invoices", description: "Reject or dispute an invoice" },
+  "payments.view": { label: "View Payments", category: "Payments", description: "View payments and the payment position" },
+  "payments.create": { label: "Prepare Payments", category: "Payments", description: "Prepare a payment against an approved invoice" },
+  "payments.approve": { label: "Approve Payments", category: "Payments", description: "Authorise a payment for release" },
+  "payments.process": { label: "Process Payments", category: "Payments", description: "Release an approved payment" },
+  "payments.reconcile": { label: "Reconcile Payments", category: "Payments", description: "Reconcile payments against bank records" },
+  "inventory.view": { label: "View Inventory", category: "Inventory", description: "View stock levels and movements" },
+  "inventory.manage": { label: "Manage Inventory", category: "Inventory", description: "Adjust, transfer and issue stock" },
+  "assets.view": { label: "View Assets", category: "Assets", description: "View the asset register" },
+  "assets.manage": { label: "Manage Assets", category: "Assets", description: "Assign, transfer, maintain and dispose of assets" },
+  "contracts.view": { label: "View Contracts", category: "Contracts", description: "View vendor contracts" },
+  "contracts.manage": { label: "Manage Contracts", category: "Contracts", description: "Create, amend, renew and terminate contracts" },
+  "documents.view": { label: "View Documents", category: "Documents", description: "View the document library" },
+  "documents.upload": { label: "Upload Documents", category: "Documents", description: "Upload and attach documents to records" },
+  "documents.delete": { label: "Delete Documents", category: "Documents", description: "Remove documents from the library" },
   "reports.view": { label: "View Reports", category: "Reports", description: "Access spend analytics and reports" },
   "reports.export": { label: "Export Reports", category: "Reports", description: "Export reports as PDF, Excel, or CSV" },
   "budgets.view": { label: "View Budgets", category: "Budgets", description: "View department budgets" },
@@ -173,29 +226,44 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
     "requests.view", "requests.create", "requests.edit.all", "requests.cancel", "requests.approve", "requests.reject", "requests.comment",
     "vendors.view", "vendors.create", "vendors.edit", "vendors.archive",
     "rfqs.view", "rfqs.create", "rfqs.issue", "rfqs.cancel", "rfqs.selectQuotation",
-    "purchaseOrders.view", "purchaseOrders.create", "purchaseOrders.issue", "purchaseOrders.cancel", "purchaseOrders.updateStatus",
+    "purchaseOrders.view", "purchaseOrders.create", "purchaseOrders.issue", "purchaseOrders.cancel", "purchaseOrders.updateStatus", "purchaseOrders.approve",
+    "goodsReceipts.view", "goodsReceipts.create", "goodsReceipts.post",
+    "invoices.view", "invoices.create", "invoices.match",
+    "payments.view",
+    "inventory.view", "assets.view",
+    "contracts.view", "contracts.manage",
+    "documents.view", "documents.upload",
     "reports.view", "reports.export", "budgets.view",
     "users.view", "settings.view", "audit.view", "ai.assistant",
   ],
   FINANCE_OFFICER: [
     "requests.view", "requests.approve", "requests.reject", "requests.comment",
     "vendors.view", "rfqs.view", "purchaseOrders.view",
+    "goodsReceipts.view",
+    "invoices.view", "invoices.create", "invoices.match", "invoices.approve", "invoices.reject",
+    "payments.view", "payments.create", "payments.approve", "payments.process", "payments.reconcile",
+    "contracts.view", "documents.view", "documents.upload",
     "reports.view", "reports.export", "budgets.view", "budgets.manage",
     "users.view", "audit.view", "ai.assistant",
   ],
   DEPARTMENT_MANAGER: [
     "requests.view", "requests.create", "requests.edit.own", "requests.cancel", "requests.approve", "requests.reject", "requests.comment",
     "vendors.view", "rfqs.view", "purchaseOrders.view",
+    "goodsReceipts.view", "invoices.view", "payments.view",
+    "inventory.view", "assets.view", "contracts.view", "documents.view",
     "reports.view", "budgets.view",
     "ai.assistant",
   ],
   EMPLOYEE: [
     "requests.view", "requests.create", "requests.edit.own", "requests.cancel", "requests.comment",
     "vendors.view", "rfqs.view", "purchaseOrders.view",
+    "documents.view",
     "ai.assistant",
   ],
   AUDITOR: [
     "requests.view", "vendors.view", "rfqs.view", "purchaseOrders.view",
+    "goodsReceipts.view", "invoices.view", "payments.view",
+    "inventory.view", "assets.view", "contracts.view", "documents.view",
     "reports.view", "reports.export", "budgets.view",
     "users.view", "settings.view", "audit.view",
   ],
@@ -926,7 +994,12 @@ export const STATUS_META: Record<RequestStatus, { label: string; color: string; 
   APPROVED: { label: "Approved", color: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900", dot: "bg-emerald-500" },
   REJECTED: { label: "Rejected", color: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900", dot: "bg-rose-500" },
   CANCELLED: { label: "Cancelled", color: "bg-muted text-muted-foreground border-border", dot: "bg-muted-foreground/30" },
-  COMPLETED: { label: "Completed", color: "bg-teal-50 text-teal-700 border-teal-200 dark:bg-teal-950/40 dark:text-teal-300 dark:border-teal-900", dot: "bg-teal-500" },
+  RETURNED: { label: "Returned for Revision", color: "bg-orange-50 text-orange-700 border-orange-200 dark:bg-orange-950/40 dark:text-orange-300 dark:border-orange-900", dot: "bg-orange-500" },
+  IN_PROCUREMENT: { label: "In Procurement", color: "bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-950/40 dark:text-indigo-300 dark:border-indigo-900", dot: "bg-indigo-500" },
+  ORDERED: { label: "Ordered", color: "bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-900", dot: "bg-violet-500" },
+  PARTIALLY_FULFILLED: { label: "Partially Fulfilled", color: "bg-cyan-50 text-cyan-700 border-cyan-200 dark:bg-cyan-950/40 dark:text-cyan-300 dark:border-cyan-900", dot: "bg-cyan-500" },
+  FULFILLED: { label: "Fulfilled", color: "bg-teal-50 text-teal-700 border-teal-200 dark:bg-teal-950/40 dark:text-teal-300 dark:border-teal-900", dot: "bg-teal-500" },
+  CLOSED: { label: "Closed", color: "bg-slate-50 text-slate-700 border-slate-200 dark:bg-slate-900/40 dark:text-slate-300 dark:border-slate-800", dot: "bg-slate-500" },
 };
 
 export const PRIORITY_META: Record<Priority, { label: string; color: string; dot: string }> = {

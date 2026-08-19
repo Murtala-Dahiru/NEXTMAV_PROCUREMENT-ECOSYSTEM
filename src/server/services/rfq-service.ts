@@ -10,12 +10,13 @@
 // (see supplier-service.ts) or are captured internally on a supplier's behalf.
 
 import type { Prisma, RFQStatus } from "@prisma/client";
-import { db } from "../db";
+import { db, type Numeric, type Tx } from "../db";
 import { conflict, forbidden, notFound, validation } from "../errors";
 import { assertPermission } from "../permissions";
 import { recordActivity, recordAudit } from "../audit";
 import { nextDocumentNumber, PREFIX } from "../numbering";
 import { emit } from "../engines/events";
+import { transition } from "../state-machine";
 import { orderBy, paginate, scoped, type Page, type ServiceContext } from "./context";
 import type {
   createRfqSchema,
@@ -103,7 +104,7 @@ export async function getById(ctx: ServiceContext, id: string) {
  * how each bid ranks on price, delivery and supplier performance, and where each
  * line item is best sourced.
  */
-function buildComparison(rfq: Prisma.RFQGetPayload<{ include: typeof rfqInclude }>) {
+function buildComparison(rfq: Numeric<Prisma.RFQGetPayload<{ include: typeof rfqInclude }>>) {
   const live = rfq.quotations.filter((q) => q.status !== "WITHDRAWN" && q.status !== "REJECTED");
   if (live.length === 0) return null;
 
@@ -424,7 +425,7 @@ export async function captureQuotation(
   if (!rfq.invitedVendors.some((iv) => iv.vendorId === args.vendorId)) {
     throw forbidden("This supplier was not invited to quote on this RFQ");
   }
-  if (rfq.status === "CLOSED" || rfq.selectedQuotationId) {
+  if (rfq.status === "CLOSED" || rfq.status === "AWARDED" || rfq.selectedQuotationId) {
     throw conflict("This RFQ has already been awarded and is no longer accepting quotations");
   }
   if (rfq.status === "CANCELLED") throw conflict("This RFQ has been cancelled");
@@ -452,8 +453,10 @@ export async function captureQuotation(
 
     const created = await tx.quotation.create({
       data: {
+        organizationId: args.organizationId,
         rfqId: rfq.id,
         vendorId: args.vendorId,
+        submittedByUserId: args.submittedByVendor ? null : args.actorId,
         revision,
         totalAmount: subtotal + tax,
         currency: rfq.quotations[0]?.currency ?? "USD",
@@ -577,6 +580,45 @@ export async function recordQuotation(
 // Evaluation and award
 // ---------------------------------------------------------------------------
 
+/**
+ * Normalised weighted total for one bid.
+ *
+ * Weights need not sum to anything in particular — they are normalised here — and
+ * a criterion where lower is better (price, lead time) is inverted so that every
+ * criterion reads "higher is better" in the total.
+ */
+async function weightedScoreFor(
+  tx: Tx,
+  quotationId: string,
+  criteria: { id: string; weight: number; maxScore: number; lowerIsBetter: boolean }[]
+): Promise<number | null> {
+  if (criteria.length === 0) return null;
+
+  const scores = await tx.quotationScore.findMany({ where: { quotationId } });
+  if (scores.length === 0) return null;
+
+  const scored = criteria.filter((c) => scores.some((s) => s.criterionId === c.id));
+  const totalWeight = scored.reduce((sum, c) => sum + c.weight, 0);
+  if (totalWeight <= 0) return null;
+
+  let total = 0;
+  for (const c of scored) {
+    const raw = scores.find((s) => s.criterionId === c.id)?.score ?? 0;
+    const normalised = c.maxScore > 0 ? raw / c.maxScore : 0;
+    const oriented = c.lowerIsBetter ? 1 - normalised : normalised;
+    total += oriented * (c.weight / totalWeight);
+  }
+  return Math.round(total * 10000) / 100;
+}
+
+/**
+ * Records a score against one bid.
+ *
+ * A single headline score is kept for the simple case, but where the RFQ defines
+ * criteria the per-criterion scores are what count: they are stored individually,
+ * weighted, and the total is derived. An award can then be defended line by line
+ * instead of resting on a number somebody typed.
+ */
 export async function evaluateQuotation(
   ctx: ServiceContext,
   rfqId: string,
@@ -586,21 +628,64 @@ export async function evaluateQuotation(
   await assertPermission(ctx.principal, "rfqs.selectQuotation");
   const tdb = scoped(ctx);
 
-  const rfq = await tdb.rFQ.findUnique({ where: { id: rfqId }, include: { quotations: true } });
+  const rfq = await tdb.rFQ.findUnique({
+    where: { id: rfqId },
+    include: { quotations: true, criteria: true },
+  });
   if (!rfq) throw notFound("RFQ not found");
 
   const quotation = rfq.quotations.find((q) => q.id === quotationId);
   if (!quotation) throw notFound("Quotation not found on this RFQ");
 
-  await db.quotation.update({
-    where: { id: quotationId },
-    data: {
-      evaluationScore: input.evaluationScore,
-      evaluationNotes: input.evaluationNotes || null,
-      status: quotation.status === "SUBMITTED" || quotation.status === "RECEIVED"
-        ? "UNDER_EVALUATION"
-        : quotation.status,
-    },
+  const criterionScores = input.criterionScores ?? [];
+  for (const cs of criterionScores) {
+    const criterion = rfq.criteria.find((c) => c.id === cs.criterionId);
+    if (!criterion) throw validation("Unknown evaluation criterion for this RFQ");
+    if (cs.score < 0 || cs.score > criterion.maxScore) {
+      throw validation(
+        `Score for "${criterion.name}" must be between 0 and ${criterion.maxScore}`
+      );
+    }
+  }
+
+  await db.$transaction(async (tx) => {
+    for (const cs of criterionScores) {
+      await tx.quotationScore.upsert({
+        where: {
+          quotationId_criterionId: { quotationId, criterionId: cs.criterionId },
+        },
+        create: {
+          quotationId,
+          criterionId: cs.criterionId,
+          score: cs.score,
+          notes: cs.notes ?? null,
+          scoredById: ctx.principal.userId,
+        },
+        update: { score: cs.score, notes: cs.notes ?? null, scoredById: ctx.principal.userId },
+      });
+    }
+
+    const weighted = await weightedScoreFor(tx, quotationId, rfq.criteria);
+
+    await tx.quotation.update({
+      where: { id: quotationId },
+      data: {
+        evaluationScore: input.evaluationScore,
+        evaluationNotes: input.evaluationNotes || null,
+        weightedScore: weighted,
+        status:
+          quotation.status === "SUBMITTED" || quotation.status === "RECEIVED"
+            ? "UNDER_EVALUATION"
+            : quotation.status,
+      },
+    });
+
+    if (rfq.status === "RECEIVED" || rfq.status === "WAITING") {
+      await tx.rFQ.update({
+        where: { id: rfqId },
+        data: { status: transition("rfq", rfq.status, "EVALUATING"), evaluatedAt: new Date() },
+      });
+    }
   });
 
   await recordAudit({
@@ -647,7 +732,27 @@ export async function award(ctx: ServiceContext, rfqId: string, input: AwardInpu
 
   const now = new Date();
   await db.$transaction(async (tx) => {
-    await tx.quotation.update({ where: { id: winner.id }, data: { status: "SELECTED" } });
+    // The award decision as a record of its own. An RFQ may be split between
+    // suppliers, and a cancelled award has to stay visible — neither of which a
+    // single "selectedQuotationId" flag can express.
+    await tx.rFQAward.create({
+      data: {
+        organizationId: ctx.principal.organizationId,
+        rfqId,
+        quotationId: winner.id,
+        vendorId: winner.vendorId,
+        awardedAmount: winner.totalAmount,
+        currency: winner.currency,
+        justification: input.justification ?? null,
+        awardedById: ctx.principal.userId,
+        awardedAt: now,
+      },
+    });
+
+    await tx.quotation.update({
+      where: { id: winner.id },
+      data: { status: "SELECTED", awardedAt: now },
+    });
     await tx.quotation.updateMany({
       where: { rfqId, id: { not: winner.id } },
       data: { status: "REJECTED" },
@@ -656,7 +761,10 @@ export async function award(ctx: ServiceContext, rfqId: string, input: AwardInpu
       where: { id: rfqId },
       data: {
         selectedQuotationId: winner.id,
-        status: "CLOSED",
+        // AWARDED, not CLOSED: the decision has been made but the RFQ still has
+        // work attached to it — the purchase order it produces. Closing it is a
+        // separate, later act, and conflating the two loses that distinction.
+        status: transition("rfq", rfq.status, "AWARDED"),
         awardedAt: now,
         awardedById: ctx.principal.userId,
       },
@@ -671,7 +779,7 @@ export async function award(ctx: ServiceContext, rfqId: string, input: AwardInpu
     resourceId: rfqId,
     before: { status: rfq.status, selectedQuotationId: null },
     after: {
-      status: "CLOSED",
+      status: "AWARDED",
       selectedQuotationId: winner.id,
       vendor: winner.vendor.companyName,
       amount: winner.totalAmount,

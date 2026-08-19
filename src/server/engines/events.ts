@@ -238,16 +238,18 @@ async function queueWebhooks(event: DomainEvent): Promise<void> {
       integrationId: i.id,
       url: readWebhookUrl(i.publicConfig) ?? "",
       event: event.type,
-      payload: JSON.stringify({
+      // jsonb: stored as a document, so a dispatcher can query the queue by event
+      // shape rather than by substring.
+      payload: {
         event: event.type,
         organizationId: event.organizationId,
-        entityType: event.entityType,
-        entityId: event.entityId,
+        entityType: event.entityType ?? null,
+        entityId: event.entityId ?? null,
         title: event.title,
         message: event.message,
         occurredAt: new Date().toISOString(),
         ...event.payload,
-      }),
+      },
       status: "PENDING",
       nextAttemptAt: new Date(),
     })),

@@ -14,6 +14,7 @@ import { AppError, rateLimited, unauthenticated, validation } from "./errors";
 import { getInternalPrincipal, getSupplierPrincipal, type InternalPrincipal, type SupplierPrincipal } from "./session";
 import { tenantDb, type TenantClient } from "./tenancy";
 import { requestContext, type RequestContext } from "./audit";
+import { drainSoon } from "./engines/outbox";
 import { db } from "./db";
 
 export interface UserCtx<P = Record<string, string>> {
@@ -177,7 +178,7 @@ export function withUser<P = Record<string, string>>(
       const params = ((await args?.params) ?? {}) as P;
       const context = await requestContext();
 
-      return ok(
+      const result = ok(
         await handler({
           req,
           params,
@@ -187,6 +188,14 @@ export function withUser<P = Record<string, string>>(
           context,
         })
       );
+
+      // Events written to the outbox inside the handler's transaction are now
+      // committed, so they are safe to deliver. Not awaited: the caller's write is
+      // already durable, and a slow notification channel must not hold the
+      // response open. Anything left behind is picked up by the next drain.
+      if (req.method !== "GET") drainSoon();
+
+      return result;
     } catch (err) {
       return errorResponse(err);
     }
