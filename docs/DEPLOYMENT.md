@@ -76,6 +76,36 @@ rather than one holding data you care about.
 
 ---
 
+## Running locally without installing Postgres
+
+The schema targets PostgreSQL, so SQLite is no longer an option locally. If you do
+not want to install a database server, the repository ships a self-contained one —
+PGlite, which is real PostgreSQL compiled to WebAssembly:
+
+```bash
+npm run db:local     # Postgres on 127.0.0.1:55432 — leave this running
+npm run db:push
+npm run db:seed
+npm run dev
+```
+
+Point both `DATABASE_URL` and `DIRECT_DATABASE_URL` at:
+
+```
+postgresql://postgres:postgres@127.0.0.1:55432/postgres?connection_limit=1
+```
+
+**One caveat.** PGlite serves a single connection at a time, and the dev server
+takes it. `verify:ui` runs against it happily because it is pure HTTP, but
+`verify:tenancy` and `verify:journeys` open their own database connections to
+assert side effects — those need a multi-connection server, so point them at Neon:
+
+```bash
+BASE_URL=http://localhost:3000 npm run verify:journeys
+```
+
+---
+
 ## Self-hosting (the `.zscripts` path)
 
 The repository also contains a self-hosted path that packages
