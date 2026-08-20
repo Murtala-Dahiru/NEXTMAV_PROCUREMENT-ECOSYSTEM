@@ -72,13 +72,43 @@ import {
   seedRequests,
   seedRFQs,
   seedSupplierActivities,
-  seedSupplierPortalUsers,
+
   seedTemplates,
   seedUsers,
-  seedVendors,
+
   seedWorkflows,
 } from "./seed-data";
 import { generateId, generatePoNumber, generateRequestNumber, generateRfqNumber } from "./format";
+
+/** The lifecycle verbs `/api/vendors/[id]/actions` accepts. */
+export type VendorAction =
+  | "INVITE"
+  | "START_ONBOARDING"
+  | "SUBMIT_FOR_REVIEW"
+  | "ACTIVATE"
+  | "SUSPEND"
+  | "REACTIVATE"
+  | "DEACTIVATE"
+  | "ARCHIVE"
+  | "RESTORE"
+  | "BLACKLIST"
+  | "LIFT_BLACKLIST"
+  | "SET_PREFERRED"
+  | "CLEAR_PREFERRED";
+
+/** A near-match the server found while creating or editing a vendor. */
+export interface VendorDuplicate {
+  id: string;
+  companyName: string;
+  legalName?: string;
+  status: string;
+  code?: string;
+  reason: string;
+  confidence: "HIGH" | "MEDIUM";
+}
+
+/** Whatever subset of the vendor form the caller is submitting. */
+export type VendorInput = Record<string, unknown>;
 
 export type ViewKey =
   | "dashboard"
@@ -122,9 +152,14 @@ export type ViewKey =
 
 interface AppState {
   // Auth/session
+  //
+  // Authentication itself is no longer decided here. The server resolves the
+  // principal before this store is ever constructed, so by the time any of this
+  // is read the caller is known to be signed in. `isAuthed` survives only as the
+  // signal consumers like `use-realtime` need: "there is a live session, it is
+  // safe to open a socket". It is set once bootstrap succeeds and cleared when
+  // the server answers 401.
   isAuthed: boolean;
-  /** False until restoreSession() has run, so the shell can hold the first paint. */
-  sessionChecked: boolean;
   /** True once organization data has been loaded from the server. */
   hydrated: boolean;
   loading: boolean;
@@ -184,14 +219,17 @@ interface AppState {
   roleOverrides: Record<UserRole, Permission[]>;
 
   // Actions — auth & theme
-  login: (email: string, password: string) => Promise<void>;
+  /** Signs out via the server action, then leaves the application. */
   logout: () => Promise<void>;
   /** Loads organization data from the server. Replaces the seed-data import. */
   hydrate: () => Promise<void>;
   /** Re-reads server state after a mutation. */
   refresh: () => Promise<void>;
-  /** Restores an existing session on page load. */
-  restoreSession: () => Promise<void>;
+  /**
+   * Establishes client state for an already-authenticated caller: reads the
+   * session for the user id and permissions, then loads the organization.
+   */
+  bootstrap: () => Promise<void>;
   setTheme: (t: "light" | "dark") => void;
   toggleTheme: () => void;
   toggleSidebar: () => void;
@@ -244,12 +282,35 @@ interface AppState {
   useTemplate: (templateId: string) => Promise<void>;
 
   // Actions — vendors
-  createVendor: (data: Omit<Vendor, "id" | "organizationId" | "createdAt" | "rating" | "status" | "totalOrders" | "totalValue" | "documents" | "complianceScore" | "onTimeDeliveryRate" | "qualityRating" | "tags" | "notes">) => void;
-  updateVendor: (id: string, data: Partial<Vendor>) => void;
-  archiveVendor: (id: string) => void;
-  blacklistVendor: (id: string) => void;
-  setPreferredVendor: (id: string) => void;
-  addVendorDocument: (vendorId: string, doc: Omit<VendorDocument, "id" | "vendorId" | "uploadedAt">) => void;
+  //
+  // Every one of these is a server call. They used to be `set(...)` on the array
+  // above, which is why a vendor added in the UI did not survive a refresh.
+  createVendor: (data: VendorInput) => Promise<{ id: string; potentialDuplicates: VendorDuplicate[] }>;
+  updateVendor: (id: string, data: VendorInput) => Promise<void>;
+  vendorAction: (id: string, action: VendorAction, reason?: string) => Promise<void>;
+  submitVendorForReview: (id: string) => Promise<void>;
+  decideVendor: (id: string, stepId: string, decision: "APPROVED" | "REJECTED", comment?: string) => Promise<void>;
+  checkVendorDuplicates: (input: {
+    companyName?: string;
+    legalName?: string;
+    taxNumber?: string;
+    registrationNumber?: string;
+    email?: string;
+    excludeId?: string;
+  }) => Promise<VendorDuplicate[]>;
+  addVendorContact: (vendorId: string, data: Record<string, unknown>) => Promise<void>;
+  updateVendorContact: (vendorId: string, contactId: string, data: Record<string, unknown>) => Promise<void>;
+  removeVendorContact: (vendorId: string, contactId: string) => Promise<void>;
+  setVendorCategories: (vendorId: string, categoryIds: string[], preferredCategoryIds?: string[]) => Promise<void>;
+  addVendorDocument: (vendorId: string, doc: Record<string, unknown>) => Promise<void>;
+  verifyVendorDocument: (vendorId: string, documentId: string, decision: "VERIFIED" | "REJECTED", reason?: string) => Promise<void>;
+  removeVendorDocument: (vendorId: string, documentId: string) => Promise<void>;
+  addVendorRequirement: (vendorId: string, data: Record<string, unknown>) => Promise<void>;
+  removeVendorRequirement: (vendorId: string, requirementId: string) => Promise<void>;
+  decideVendorRequirement: (vendorId: string, requirementId: string, data: { decision: "VERIFIED" | "REJECTED" | "UNDER_REVIEW" | "WAIVED"; notes?: string; expiresAt?: string }) => Promise<void>;
+  assessVendorRisk: (vendorId: string, data: { level: string; score: number; summary?: string; nextReviewAt?: string; factors?: Record<string, number> }) => Promise<void>;
+  addVendorNote: (vendorId: string, body: string, visibility?: "INTERNAL" | "RESTRICTED") => Promise<void>;
+  removeVendorNote: (vendorId: string, noteId: string) => Promise<void>;
 
   // Actions — RFQs
   createRFQ: (data: {
@@ -391,11 +452,13 @@ const emptyDomainState = {
 
 const initialState = {
   isAuthed: false,
-  sessionChecked: false,
   hydrated: false,
   loading: false,
   loadError: null as string | null,
-  currentUserId: "usr_amina",
+  // Replaced by the real id as soon as `bootstrap` reads the session. It is never
+  // used to authorise anything — every mutation is checked server-side against
+  // the principal — so a stale value here cannot grant access to another account.
+  currentUserId: "",
   theme: "light" as const,
   sidebarCollapsed: false,
   view: "dashboard" as ViewKey,
@@ -475,35 +538,24 @@ export const useStore = create<AppState>()(
     (set, get) => ({
       ...initialState,
 
-      // Auth — server-backed.
+      // Auth — Supabase-backed, resolved on the server.
       //
-      // `login` now verifies credentials against the server and receives an
-      // httpOnly session cookie. The previous implementation simply set
-      // `isAuthed = true` and ignored what the user typed.
-      login: async (email: string, password: string) => {
-        const { api } = await import("./api/client");
-        const result = await api.post<{ user: { id: string } }>("/api/auth/login", {
-          email,
-          password,
-        });
-        set({ isAuthed: true, currentUserId: result.user.id, view: "dashboard" });
-        await get().hydrate();
-      },
-
+      // There is no `login` action any more. Credentials are submitted to a
+      // Server Action from the sign-in page, which is what lets a password reach
+      // Supabase without passing through client-side application code at all.
       logout: async () => {
-        const { api } = await import("./api/client");
-        // Clear locally regardless of whether the call succeeds — a user pressing
-        // "sign out" must always end up signed out of this browser.
-        try {
-          await api.post("/api/auth/logout");
-        } finally {
-          set({
-            isAuthed: false,
-            view: "dashboard",
-            hydrated: false,
-            ...emptyDomainState,
-          });
-        }
+        // Clear locally first, so the cached organization data is gone from
+        // memory even if the network call stalls. The action redirects to
+        // /login, which unmounts this tree entirely.
+        set({
+          isAuthed: false,
+          view: "dashboard",
+          hydrated: false,
+          ...emptyDomainState,
+        });
+
+        const { signOutAction } = await import("@/app/(auth)/actions");
+        await signOutAction();
       },
 
       /**
@@ -548,24 +600,43 @@ export const useStore = create<AppState>()(
         }
       },
 
-      /** Restores an existing session on page load, so a refresh keeps you signed in. */
-      restoreSession: async () => {
+      /**
+       * Prepares client state for a caller the server has already authenticated.
+       *
+       * `/api/auth/session` is still the source for the user id and the effective
+       * permission set — those come from the database and the role model, which
+       * the Supabase token knows nothing about. A 401 here means the session died
+       * between the server render and this call, so the page is reloaded and the
+       * proxy sends the user to sign in.
+       */
+      bootstrap: async () => {
         const { api } = await import("./api/client");
         try {
           const session = await api.get<{
             authenticated: boolean;
             user?: { id: string };
+            permissions?: Permission[];
           }>("/api/auth/session");
 
           if (!session.authenticated || !session.user) {
-            set({ isAuthed: false, sessionChecked: true });
+            // A hard navigation, not router.push. The lint rule assumes a soft
+            // navigation is always preferable, but that assumption fails here:
+            // a client-side transition keeps this store — and the organization
+            // data in it — alive in memory across the sign-out boundary. A full
+            // document load is what guarantees it is gone.
+            // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+            if (typeof window !== "undefined") window.location.href = "/login";
             return;
           }
 
-          set({ isAuthed: true, currentUserId: session.user.id, sessionChecked: true });
+          set({
+            isAuthed: true,
+            currentUserId: session.user.id,
+            permissions: session.permissions ?? [],
+          });
           await get().hydrate();
         } catch {
-          set({ isAuthed: false, sessionChecked: true });
+          set({ loadError: "Could not confirm your session. Reload the page to try again." });
         }
       },
 
@@ -829,98 +900,137 @@ export const useStore = create<AppState>()(
       },
 
       // Vendors
-      createVendor: (data) => {
-        const now = new Date().toISOString();
-        const newVendor: Vendor = {
-          ...data,
-          id: generateId("vnd"),
-          organizationId: get().organization.id,
-          rating: 0,
-          status: "PROSPECTIVE",
-          totalOrders: 0,
-          totalValue: 0,
-          documents: [],
-          complianceScore: 0,
-          onTimeDeliveryRate: 0,
-          qualityRating: 0,
-          tags: [],
-          notes: "",
-          createdAt: now,
-        };
-        set((s) => ({ vendors: [newVendor, ...s.vendors] }));
-        logEvent(get, set, {
-          eventType: "VENDOR_ADDED",
-          description: `${get().users.find((u) => u.id === get().currentUserId)?.name} added new vendor: ${data.companyName}`,
-          vendorId: newVendor.id,
-        });
+      //
+      // Each of these posts to the vendor API and then re-reads the organization,
+      // so the store's copy is whatever the database actually holds rather than an
+      // optimistic guess about what the server would have done. The server owns
+      // the lifecycle, the permission check and the audit entry; nothing here
+      // decides anything.
+
+      createVendor: async (data) => {
+        const { api } = await import("./api/client");
+        const created = await api.post<{ id: string; potentialDuplicates?: VendorDuplicate[] }>(
+          "/api/vendors",
+          data
+        );
+        await get().refresh();
+        return { id: created.id, potentialDuplicates: created.potentialDuplicates ?? [] };
       },
 
-      updateVendor: (id, data) =>
-        set((s) => ({
-          vendors: s.vendors.map((v) => (v.id === id ? { ...v, ...data } : v)),
-        })),
-
-      archiveVendor: (id) => {
-        set((s) => ({
-          vendors: s.vendors.map((v) =>
-            v.id === id ? { ...v, status: v.status === "ARCHIVED" ? "ACTIVE" : "ARCHIVED" } : v
-          ),
-        }));
-        const v = get().vendors.find((x) => x.id === id);
-        logEvent(get, set, {
-          eventType: "VENDOR_ARCHIVED",
-          description: `${v?.companyName} ${v?.status === "ARCHIVED" ? "restored" : "archived"}`,
-          severity: "WARNING",
-          vendorId: id,
-        });
+      updateVendor: async (id, data) => {
+        const { api } = await import("./api/client");
+        await api.patch(`/api/vendors/${id}`, data);
+        await get().refresh();
       },
 
-      blacklistVendor: (id) => {
-        set((s) => ({
-          vendors: s.vendors.map((v) =>
-            v.id === id ? { ...v, status: "BLACKLISTED" } : v
-          ),
-        }));
-        const v = get().vendors.find((x) => x.id === id);
-        logEvent(get, set, {
-          eventType: "VENDOR_BLACKLISTED",
-          description: `${v?.companyName} blacklisted`,
-          severity: "CRITICAL",
-          vendorId: id,
-        });
+      vendorAction: async (id, action, reason) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/vendors/${id}/actions`, { action, reason: reason ?? "" });
+        await get().refresh();
       },
 
-      setPreferredVendor: (id) => {
-        set((s) => ({
-          vendors: s.vendors.map((v) =>
-            v.id === id ? { ...v, status: "PREFERRED" } : v
-          ),
-        }));
-        const v = get().vendors.find((x) => x.id === id);
-        logEvent(get, set, {
-          eventType: "VENDOR_UPDATED",
-          description: `${v?.companyName} marked as preferred vendor`,
-          vendorId: id,
-        });
+      submitVendorForReview: async (id) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/vendors/${id}/submit`);
+        await get().refresh();
       },
 
-      addVendorDocument: (vendorId, doc) => {
-        const newDoc: VendorDocument = {
-          ...doc,
-          id: generateId("vd"),
-          vendorId,
-          uploadedAt: new Date().toISOString(),
-        };
-        set((s) => ({
-          vendors: s.vendors.map((v) =>
-            v.id === vendorId ? { ...v, documents: [...v.documents, newDoc] } : v
-          ),
-        }));
-        logEvent(get, set, {
-          eventType: "FILE_UPLOADED",
-          description: `Document '${doc.name}' uploaded for vendor`,
-          vendorId,
+      decideVendor: async (id, stepId, decision, comment) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/vendors/${id}/decide`, { stepId, decision, comment: comment ?? "" });
+        await get().refresh();
+      },
+
+      checkVendorDuplicates: async (input) => {
+        const { api } = await import("./api/client");
+        return api.post<VendorDuplicate[]>("/api/vendors/duplicates", input);
+      },
+
+      addVendorContact: async (vendorId, data) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/vendors/${vendorId}/contacts`, data);
+        await get().refresh();
+      },
+
+      updateVendorContact: async (vendorId, contactId, data) => {
+        const { api } = await import("./api/client");
+        await api.patch(`/api/vendors/${vendorId}/contacts/${contactId}`, data);
+        await get().refresh();
+      },
+
+      removeVendorContact: async (vendorId, contactId) => {
+        const { api } = await import("./api/client");
+        await api.del(`/api/vendors/${vendorId}/contacts/${contactId}`);
+        await get().refresh();
+      },
+
+      setVendorCategories: async (vendorId, categoryIds, preferredCategoryIds) => {
+        const { api } = await import("./api/client");
+        await api.put(`/api/vendors/${vendorId}/categories`, {
+          categoryIds,
+          preferredCategoryIds: preferredCategoryIds ?? [],
         });
+        await get().refresh();
+      },
+
+      addVendorDocument: async (vendorId, doc) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/vendors/${vendorId}/documents`, doc);
+        await get().refresh();
+      },
+
+      verifyVendorDocument: async (vendorId, documentId, decision, reason) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/vendors/${vendorId}/documents/${documentId}/verify`, {
+          decision,
+          reason: reason ?? "",
+        });
+        await get().refresh();
+      },
+
+      removeVendorDocument: async (vendorId, documentId) => {
+        const { api } = await import("./api/client");
+        await api.del(`/api/vendors/${vendorId}/documents/${documentId}`);
+        await get().refresh();
+      },
+
+      addVendorRequirement: async (vendorId, data) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/vendors/${vendorId}/compliance`, data);
+        await get().refresh();
+      },
+
+      removeVendorRequirement: async (vendorId, requirementId) => {
+        const { api } = await import("./api/client");
+        await api.del(`/api/vendors/${vendorId}/compliance/${requirementId}`);
+        await get().refresh();
+      },
+
+      decideVendorRequirement: async (vendorId, requirementId, data) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/vendors/${vendorId}/compliance/${requirementId}/decide`, data);
+        await get().refresh();
+      },
+
+      assessVendorRisk: async (vendorId, data) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/vendors/${vendorId}/risk`, data);
+        await get().refresh();
+      },
+
+      addVendorNote: async (vendorId, body, visibility) => {
+        const { api } = await import("./api/client");
+        await api.post(`/api/vendors/${vendorId}/notes`, {
+          body,
+          visibility: visibility ?? "INTERNAL",
+        });
+        await get().refresh();
+      },
+
+      removeVendorNote: async (vendorId, noteId) => {
+        const { api } = await import("./api/client");
+        await api.del(`/api/vendors/${vendorId}/notes/${noteId}`);
+        await get().refresh();
       },
 
       // RFQs
@@ -959,7 +1069,7 @@ export const useStore = create<AppState>()(
           id,
           rfqNumber: generateRfqNumber(seq),
           title: `${rfq.title} (Copy)`,
-          status: "WAITING",
+          status: "PUBLISHED",
           quotations: [],
           selectedQuotationId: undefined,
           remindersSent: 0,

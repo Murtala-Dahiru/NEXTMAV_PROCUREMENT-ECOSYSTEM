@@ -44,6 +44,7 @@ function section(title) {
 class Client {
   constructor(label) {
     this.label = label;
+    this.cookies = new Map();
     this.cookie = "";
   }
 
@@ -57,11 +58,22 @@ class Client {
       body: body === undefined ? undefined : JSON.stringify(body),
     });
 
+    // Sessions are issued by Supabase Auth, whose cookies are named
+    // `sb-<project-ref>-auth-token` and are split into `.0`, `.1` … chunks when
+    // the JWT exceeds the 4KB cookie limit. Matching one fixed name would capture
+    // only part of the session — or, after the migration off `nextmav.sid`, none
+    // of it — so every cookie is kept and replayed.
     const setCookie = res.headers.getSetCookie?.() ?? [];
     for (const c of setCookie) {
       const [pair] = c.split(";");
-      if (pair.startsWith("nextmav.sid=")) this.cookie = pair;
+      const eq = pair.indexOf("=");
+      if (eq < 1) continue;
+      const name = pair.slice(0, eq);
+      const value = pair.slice(eq + 1);
+      if (value === "" || value === "deleted") this.cookies.delete(name);
+      else this.cookies.set(name, value);
     }
+    this.cookie = [...this.cookies].map(([k, v]) => `${k}=${v}`).join("; ");
 
     let payload = null;
     const text = await res.text();

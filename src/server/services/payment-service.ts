@@ -145,8 +145,12 @@ export async function create(ctx: ServiceContext, input: CreateInput) {
       `Invoice ${invoice.invoiceNumber} is ${invoice.status.replace(/_/g, " ").toLowerCase()} and has not been approved for payment`
     );
   }
-  if (invoice.vendor.status === "BLACKLISTED") {
-    throw conflict(`${invoice.vendor.companyName} is blacklisted — payment is blocked`);
+  // Paying a suspended supplier for goods already received is legitimate; paying
+  // one the organization has barred is not. Only the terminal bars block here.
+  if (invoice.vendor.status === "BLACKLISTED" || invoice.vendor.status === "ARCHIVED") {
+    throw conflict(
+      `${invoice.vendor.companyName} ${invoice.vendor.status === "BLACKLISTED" ? "is blacklisted" : "has been archived"} — payment is blocked`
+    );
   }
 
   // Overpayment guard, counting money already committed to in-flight payments.

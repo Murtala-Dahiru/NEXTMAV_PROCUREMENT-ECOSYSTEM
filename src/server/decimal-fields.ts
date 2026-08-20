@@ -18,6 +18,10 @@ export const decimalAsNumber = {
   name: "decimal-as-number",
   result: {
   vendor: {
+    minimumOrderValue: {
+      needs: { minimumOrderValue: true },
+      compute: (r: { minimumOrderValue: Prisma.Decimal | null }) => r.minimumOrderValue === null || r.minimumOrderValue === undefined ? null : Number(r.minimumOrderValue),
+    },
     totalValue: {
       needs: { totalValue: true },
       compute: (r: { totalValue: Prisma.Decimal }) => Number(r.totalValue),
@@ -75,13 +79,45 @@ export const decimalAsNumber = {
       compute: (r: { amount: Prisma.Decimal | null }) => r.amount === null || r.amount === undefined ? null : Number(r.amount),
     },
   },
+  sourcingEvent: {
+    estimatedValue: {
+      needs: { estimatedValue: true },
+      compute: (r: { estimatedValue: Prisma.Decimal | null }) => r.estimatedValue === null || r.estimatedValue === undefined ? null : Number(r.estimatedValue),
+    },
+  },
+  rFQ: {
+    estimatedValue: {
+      needs: { estimatedValue: true },
+      compute: (r: { estimatedValue: Prisma.Decimal | null }) => r.estimatedValue === null || r.estimatedValue === undefined ? null : Number(r.estimatedValue),
+    },
+  },
   rFQLineItem: {
     quantity: {
       needs: { quantity: true },
       compute: (r: { quantity: Prisma.Decimal }) => Number(r.quantity),
     },
+    targetPrice: {
+      needs: { targetPrice: true },
+      compute: (r: { targetPrice: Prisma.Decimal | null }) => r.targetPrice === null || r.targetPrice === undefined ? null : Number(r.targetPrice),
+    },
   },
   quotation: {
+    subtotal: {
+      needs: { subtotal: true },
+      compute: (r: { subtotal: Prisma.Decimal }) => Number(r.subtotal),
+    },
+    discountAmount: {
+      needs: { discountAmount: true },
+      compute: (r: { discountAmount: Prisma.Decimal }) => Number(r.discountAmount),
+    },
+    taxAmount: {
+      needs: { taxAmount: true },
+      compute: (r: { taxAmount: Prisma.Decimal }) => Number(r.taxAmount),
+    },
+    shippingAmount: {
+      needs: { shippingAmount: true },
+      compute: (r: { shippingAmount: Prisma.Decimal }) => Number(r.shippingAmount),
+    },
     totalAmount: {
       needs: { totalAmount: true },
       compute: (r: { totalAmount: Prisma.Decimal }) => Number(r.totalAmount),
@@ -96,9 +132,49 @@ export const decimalAsNumber = {
       needs: { unitPrice: true },
       compute: (r: { unitPrice: Prisma.Decimal }) => Number(r.unitPrice),
     },
+    discountPercent: {
+      needs: { discountPercent: true },
+      compute: (r: { discountPercent: Prisma.Decimal }) => Number(r.discountPercent),
+    },
+    discountAmount: {
+      needs: { discountAmount: true },
+      compute: (r: { discountAmount: Prisma.Decimal }) => Number(r.discountAmount),
+    },
     taxRate: {
       needs: { taxRate: true },
       compute: (r: { taxRate: Prisma.Decimal }) => Number(r.taxRate),
+    },
+    taxAmount: {
+      needs: { taxAmount: true },
+      compute: (r: { taxAmount: Prisma.Decimal }) => Number(r.taxAmount),
+    },
+    deliveryCost: {
+      needs: { deliveryCost: true },
+      compute: (r: { deliveryCost: Prisma.Decimal }) => Number(r.deliveryCost),
+    },
+    lineTotal: {
+      needs: { lineTotal: true },
+      compute: (r: { lineTotal: Prisma.Decimal }) => Number(r.lineTotal),
+    },
+  },
+  awardRecommendation: {
+    recommendedAmount: {
+      needs: { recommendedAmount: true },
+      compute: (r: { recommendedAmount: Prisma.Decimal }) => Number(r.recommendedAmount),
+    },
+  },
+  awardRecommendationItem: {
+    quantity: {
+      needs: { quantity: true },
+      compute: (r: { quantity: Prisma.Decimal }) => Number(r.quantity),
+    },
+    unitPrice: {
+      needs: { unitPrice: true },
+      compute: (r: { unitPrice: Prisma.Decimal }) => Number(r.unitPrice),
+    },
+    lineTotal: {
+      needs: { lineTotal: true },
+      compute: (r: { lineTotal: Prisma.Decimal }) => Number(r.lineTotal),
     },
   },
   rFQAward: {

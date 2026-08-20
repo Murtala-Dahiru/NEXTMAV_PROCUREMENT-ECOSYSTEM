@@ -91,6 +91,8 @@ export const api = {
   get: <T>(path: string, params?: Record<string, unknown>) => request<T>("GET", `${path}${qs(params)}`),
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
   patch: <T>(path: string, body?: unknown) => request<T>("PATCH", path, body),
+  /** Full replacement of a sub-collection — the vendor category set uses it. */
+  put: <T>(path: string, body?: unknown) => request<T>("PUT", path, body),
   del: <T>(path: string) => request<T>("DELETE", path),
 };
 
@@ -115,9 +117,20 @@ export async function mutate<T>(
 
     if (err.isUnauthenticated) {
       toast.error("Your session has expired", { description: "Please sign in again." });
-      // Let the shell re-render the login screen rather than hard-reloading.
+
       const { useStore } = await import("@/lib/store");
       useStore.setState({ isAuthed: false });
+
+      // A full navigation, not a client-side re-render. Sign-in is a real route
+      // now, and the cached organization data in this tab must not outlive the
+      // session it was loaded under. `next` brings the user back afterwards.
+      // The lint rule prefers a soft navigation; that would preserve the very
+      // in-memory state this is trying to discard.
+      if (typeof window !== "undefined") {
+        const next = encodeURIComponent(window.location.pathname + window.location.search);
+        // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+        window.location.href = `/login?next=${next}`;
+      }
       return null;
     }
 

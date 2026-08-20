@@ -45,10 +45,15 @@ const REQUESTER: Permission[] = [
   "vendors.view", "rfqs.view", "purchaseOrders.view", "documents.view", "ai.assistant",
 ];
 
+// A procurement officer builds and runs the sourcing event but does not decide
+// it: §40 puts publication, award approval and the award itself with the manager.
+// The officer can still recommend an award — proposing is the work, approving is
+// the control, and separating them is the point of the whole approval chain.
 const SOURCING: Permission[] = [
   "requests.view", "requests.comment",
-  "vendors.view", "vendors.create", "vendors.edit",
-  "rfqs.view", "rfqs.create", "rfqs.issue", "rfqs.cancel", "rfqs.selectQuotation",
+  "vendors.view", "vendors.create", "vendors.edit", "vendors.notes",
+  "rfqs.view", "rfqs.create", "rfqs.cancel",
+  "rfqs.manageEvaluation", "rfqs.evaluate", "rfqs.clarify", "rfqs.recommendAward",
   "purchaseOrders.view", "purchaseOrders.create",
   "goodsReceipts.view", "invoices.view",
   "contracts.view", "documents.view", "documents.upload",
@@ -80,7 +85,9 @@ export const SYSTEM_ROLES: SystemRole[] = [
     legacyRole: null,
     permissions: [
       "requests.view", "requests.approve", "requests.reject", "requests.comment",
-      "vendors.view", "rfqs.view", "purchaseOrders.view", "purchaseOrders.approve",
+      "vendors.view", "vendors.approve", "vendors.notes",
+      "rfqs.view", "rfqs.evaluate", "rfqs.approveAward",
+      "purchaseOrders.view", "purchaseOrders.approve",
       "goodsReceipts.view", "invoices.view", "payments.view", "payments.approve",
       "contracts.view", "documents.view",
       "reports.view", "reports.export", "budgets.view", "audit.view", "ai.assistant",
@@ -149,6 +156,7 @@ export const SYSTEM_ROLES: SystemRole[] = [
     legacyRole: null,
     permissions: [
       "vendors.view", "vendors.create", "vendors.edit", "vendors.archive",
+      "vendors.approve", "vendors.suspend", "vendors.compliance", "vendors.risk", "vendors.notes", "vendors.portal",
       "contracts.view", "contracts.manage",
       "rfqs.view", "purchaseOrders.view", "invoices.view",
       "documents.view", "documents.upload", "reports.view", "ai.assistant",
@@ -177,6 +185,22 @@ export const SYSTEM_ROLES: SystemRole[] = [
       "purchaseOrders.view", "goodsReceipts.view",
       "assets.view", "assets.manage", "inventory.view",
       "documents.view", "documents.upload", "reports.view", "ai.assistant",
+    ],
+  },
+  {
+    key: "EVALUATOR",
+    name: "Evaluator",
+    description:
+      "Sits on RFQ evaluation panels: scores the bids they are assigned and nothing more.",
+    rank: 45,
+    legacyRole: null,
+    // Deliberately narrow. An evaluator holds "rfqs.view" because they must read
+    // the RFQ they are judging, but the service still checks panel membership
+    // before showing them a bid — the permission opens the module, the seat opens
+    // the document.
+    permissions: [
+      "rfqs.view", "rfqs.evaluate",
+      "vendors.view", "documents.view", "ai.assistant",
     ],
   },
   {
@@ -221,27 +245,33 @@ export function assertKnownPermissions(permissions: string[]): Permission[] {
  *
  * Idempotent, and deliberately non-destructive: a role that already exists keeps
  * whatever permissions the organization has configured for it. Only its
- * descriptive fields are refreshed, so re-running this never silently restores
- * an access grant an administrator removed.
+ * descriptive fields are refreshed, and only when they have actually drifted, so
+ * re-running this never silently restores an access grant an administrator
+ * removed — and never spends a write to change nothing.
+ *
+ * Written in bulk rather than role by role, which is not premature optimization
+ * but a correctness fix. This runs inside the provisioning transaction, and the
+ * previous version issued one `create` per role, each carrying a nested write for
+ * its permissions — roughly thirty sequential round trips for the fifteen roles
+ * below. Against a pooled database in another region that exceeded Prisma's
+ * 30-second interactive transaction timeout, so the transaction expired
+ * mid-flight and *every* sign-up on a fresh organization failed with P2028. The
+ * three statements here do the same work in three round trips.
  */
 export async function ensureSystemRoles(organizationId: string, client: Tx) {
   const existing = await client.role.findMany({
     where: { organizationId },
-    select: { id: true, key: true },
+    // Enough to tell whether a refresh is warranted, so the common case — nothing
+    // has drifted — costs no writes at all.
+    select: { id: true, key: true, name: true, description: true, rank: true, isSystem: true },
   });
-  const byKey = new Map(existing.map((r) => [r.key, r.id]));
+  const byKey = new Map(existing.map((r) => [r.key, r]));
 
-  for (const role of SYSTEM_ROLES) {
-    const id = byKey.get(role.key);
-    if (id) {
-      await client.role.update({
-        where: { id },
-        data: { name: role.name, description: role.description, rank: role.rank, isSystem: true },
-      });
-      continue;
-    }
-    await client.role.create({
-      data: {
+  const missing = SYSTEM_ROLES.filter((role) => !byKey.has(role.key));
+
+  if (missing.length > 0) {
+    await client.role.createMany({
+      data: missing.map((role) => ({
         organizationId,
         key: role.key,
         name: role.name,
@@ -249,12 +279,50 @@ export async function ensureSystemRoles(organizationId: string, client: Tx) {
         rank: role.rank,
         isSystem: true,
         legacyRole: role.legacyRole,
-        // Deduplicated: several role definitions are composed from others, and a
-        // permission granted twice is the same grant, not a conflict.
-        permissions: {
-          create: [...new Set(role.permissions)].map((permission) => ({ permission })),
-        },
-      },
+      })),
+      // Two provisioning attempts racing over the same organization would
+      // otherwise collide on the (organizationId, key) unique index; the loser
+      // adopts what the winner wrote, which is the same thing it meant to write.
+      skipDuplicates: true,
+    });
+
+    // The ids are needed to attach permissions, and `createMany` does not return
+    // rows. One read is still far cheaper than fifteen nested creates.
+    const created = await client.role.findMany({
+      where: { organizationId, key: { in: missing.map((r) => r.key) } },
+      select: { id: true, key: true },
+    });
+    const idByKey = new Map(created.map((r) => [r.key, r.id]));
+
+    const permissions = missing.flatMap((role) => {
+      const roleId = idByKey.get(role.key);
+      if (!roleId) return [];
+      // Deduplicated: several role definitions are composed from others, and a
+      // permission granted twice is the same grant, not a conflict.
+      return [...new Set(role.permissions)].map((permission) => ({ roleId, permission }));
+    });
+
+    if (permissions.length > 0) {
+      await client.rolePermission.createMany({ data: permissions, skipDuplicates: true });
+    }
+  }
+
+  // Descriptive drift on roles that already existed. Almost always empty, so this
+  // loop almost always costs nothing.
+  for (const role of SYSTEM_ROLES) {
+    const current = byKey.get(role.key);
+    if (!current) continue;
+    if (
+      current.name === role.name &&
+      current.description === role.description &&
+      current.rank === role.rank &&
+      current.isSystem
+    ) {
+      continue;
+    }
+    await client.role.update({
+      where: { id: current.id },
+      data: { name: role.name, description: role.description, rank: role.rank, isSystem: true },
     });
   }
 

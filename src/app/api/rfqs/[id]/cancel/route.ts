@@ -1,4 +1,4 @@
-// /api/rfqs/[id]/cancel — cancel an open RFQ.
+// /api/rfqs/[id]/cancel — stop a sourcing round. Bids are kept, never deleted.
 import { cancelSchema } from "@/lib/schemas/procurement";
 import { parseBody, withUser } from "@/server/http";
 import * as service from "@/server/services/rfq-service";

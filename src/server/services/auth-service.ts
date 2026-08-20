@@ -1,22 +1,36 @@
 // NextMav Procure — authentication service.
 //
+// Credentials for the internal realm are held by Supabase Auth. This module is
+// what sits either side of it: translating a NextMav sign-in into a Supabase one,
+// and translating Supabase's answer back into a NextMav principal and an audit
+// trail. The supplier realm below is unchanged and still verifies scrypt hashes
+// locally.
+//
 // Both realms share one rule: the caller learns only "those credentials did not
 // work". Never "no such account", never "wrong password", never "your account is
 // suspended" — each of those is an account-enumeration oracle. The reason is
 // recorded server-side in the audit log where an administrator can see it.
+//
+// There is one deliberate exception. An unverified account is told so explicitly,
+// because the alternative is a user who typed the right password being told it is
+// wrong, with no route forward — and the verification email Supabase already sent
+// has disclosed the account's existence to that address regardless.
 
 import { db } from "../db";
 import { AppError, unauthenticated } from "../errors";
-import { hashPassword, needsRehash, verifyPassword } from "../password";
+import { hashPassword, verifyPassword } from "../password";
 import { recordActivity, recordAudit, type RequestContext } from "../audit";
 import {
   createSupplierSession,
-  createUserSession,
   destroySupplierSession,
   destroyUserSession,
 } from "../session";
+import { supabaseServer } from "../supabase/server";
 
 const GENERIC_FAILURE = "Incorrect email or password";
+
+/** Raised when the password was right but the address has never been verified. */
+export const EMAIL_UNVERIFIED = "EMAIL_UNVERIFIED";
 
 // ---------------------------------------------------------------------------
 // Internal users
@@ -28,83 +42,105 @@ export async function loginUser(
   context: RequestContext
 ) {
   const normalised = email.trim().toLowerCase();
+  const supabase = await supabaseServer();
 
-  // Not `findUnique` — email is unique per organization, not globally, and this
-  // login form is org-agnostic. Where one address exists in several tenants the
-  // active account wins; a genuine multi-org login picker is a P3 concern.
-  const candidates = await db.user.findMany({
-    where: { email: normalised },
-    orderBy: { createdAt: "asc" },
+  // Supabase verifies the credential and, on success, writes the session cookies
+  // through the client's cookie adapter. This must therefore be called from a
+  // Route Handler or Server Action, where writing cookies is permitted.
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email: normalised,
+    password,
   });
 
-  const user = candidates.find((u) => u.status === "ACTIVE") ?? candidates[0] ?? null;
-
-  // Always run the verification so the response time does not reveal whether the
-  // address exists. `verifyPassword` burns equivalent work when the hash is null.
-  const passwordOk = await verifyPassword(password, user?.passwordHash);
-
-  if (!user || !passwordOk) {
-    if (user) {
-      await recordAudit({
-        organizationId: user.organizationId,
-        userId: user.id,
-        action: "auth.login_failed",
-        resource: "User",
-        resourceId: user.id,
-        after: { reason: "bad_password" },
-        context,
-      });
+  if (error || !data.user) {
+    // Supabase distinguishes an unconfirmed address from a bad password. Passing
+    // that one distinction through is what lets the sign-in screen offer to
+    // resend the verification email instead of stranding the user.
+    if (error?.code === "email_not_confirmed") {
+      throw new AppError(
+        "UNAUTHENTICATED",
+        "Your email address has not been verified yet. Check your inbox for the verification link.",
+        { reason: EMAIL_UNVERIFIED, email: normalised }
+      );
     }
     throw unauthenticated(GENERIC_FAILURE);
   }
 
-  if (user.status !== "ACTIVE") {
+  // Everything past this point runs with the Supabase session cookies ALREADY
+  // written — `signInWithPassword` persists them through the client's cookie
+  // adapter the moment the credential checks out. So any failure from here on has
+  // to undo that, or the caller is told "sign-in failed" while holding a perfectly
+  // valid session, and the next page load lets them in.
+  //
+  // That is not hypothetical: a transient P1001 from the database on the lookup
+  // below produced exactly that state — an error on the screen, a signed-in
+  // session in the jar. The two explicit rejections were already careful to sign
+  // out; this makes the *unexpected* failures behave the same way.
+  try {
+    const user = await db.user.findUnique({ where: { authUserId: data.user.id } });
+
+    // A valid Supabase identity with no NextMav user row means provisioning never
+    // completed. The credential is not at fault, but there is no tenant to place
+    // this person in, so the session is discarded rather than left half-signed-in.
+    if (!user) {
+      await supabase.auth.signOut().catch(() => {});
+      console.error(
+        `[auth] no User row for Supabase auth id ${data.user.id} (${normalised}) — provisioning incomplete`
+      );
+      throw unauthenticated(GENERIC_FAILURE);
+    }
+
+    if (user.status !== "ACTIVE") {
+      await supabase.auth.signOut().catch(() => {});
+      await recordAudit({
+        organizationId: user.organizationId,
+        userId: user.id,
+        action: "auth.login_denied",
+        resource: "User",
+        resourceId: user.id,
+        after: { reason: `status_${user.status.toLowerCase()}` },
+        context,
+      });
+      // Correct credentials but an unusable account still yields the generic message.
+      throw unauthenticated(GENERIC_FAILURE);
+    }
+
+    await db.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
+
     await recordAudit({
       organizationId: user.organizationId,
       userId: user.id,
-      action: "auth.login_denied",
+      action: "auth.login",
       resource: "User",
       resourceId: user.id,
-      after: { reason: `status_${user.status.toLowerCase()}` },
       context,
     });
-    // Correct credentials but an unusable account still yields the generic message.
-    throw unauthenticated(GENERIC_FAILURE);
+    await recordActivity({
+      organizationId: user.organizationId,
+      userId: user.id,
+      eventType: "USER_LOGIN",
+      description: `${user.name} signed in`,
+      context,
+    });
+
+    return {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      organizationId: user.organizationId,
+    };
+  } catch (e) {
+    // The two branches above have already signed out and are simply propagating;
+    // signing out twice is harmless, and catching everything is the point — the
+    // invariant is that no path leaves this function with a live session and a
+    // thrown error.
+    await supabase.auth.signOut().catch(() => {});
+    if (!(e instanceof AppError)) {
+      console.error(`[auth] sign-in failed after credential check for ${normalised}`, e);
+    }
+    throw e;
   }
-
-  // Transparently upgrade hashes created under weaker parameters.
-  if (needsRehash(user.passwordHash)) {
-    await db.user
-      .update({ where: { id: user.id }, data: { passwordHash: await hashPassword(password) } })
-      .catch(() => {});
-  }
-
-  await createUserSession(user.id, context);
-  await db.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
-
-  await recordAudit({
-    organizationId: user.organizationId,
-    userId: user.id,
-    action: "auth.login",
-    resource: "User",
-    resourceId: user.id,
-    context,
-  });
-  await recordActivity({
-    organizationId: user.organizationId,
-    userId: user.id,
-    eventType: "USER_LOGIN",
-    description: `${user.name} signed in`,
-    context,
-  });
-
-  return {
-    id: user.id,
-    name: user.name,
-    email: user.email,
-    role: user.role,
-    organizationId: user.organizationId,
-  };
 }
 
 export async function logoutUser(
@@ -141,7 +177,17 @@ export async function changeOwnPassword(
   const user = await db.user.findUnique({ where: { id: userId } });
   if (!user) throw unauthenticated();
 
-  if (!(await verifyPassword(currentPassword, user.passwordHash))) {
+  const supabase = await supabaseServer();
+
+  // Re-authenticate before allowing the change. Holding a live session is not
+  // sufficient: an unattended logged-in browser must not be enough for a
+  // passer-by to seize the account by resetting its password.
+  const { error: reauthError } = await supabase.auth.signInWithPassword({
+    email: user.email,
+    password: currentPassword,
+  });
+
+  if (reauthError) {
     await recordAudit({
       organizationId,
       userId,
@@ -153,15 +199,13 @@ export async function changeOwnPassword(
     throw new AppError("VALIDATION", "Current password is incorrect");
   }
 
-  await db.user.update({
-    where: { id: userId },
-    data: { passwordHash: await hashPassword(newPassword) },
-  });
-
-  // Every other session for this user dies, so a password change actually evicts
-  // an attacker who already had one.
-  await db.session.deleteMany({ where: { userId } });
-  await createUserSession(userId, context);
+  const { error: updateError } = await supabase.auth.updateUser({ password: newPassword });
+  if (updateError) {
+    throw new AppError(
+      "VALIDATION",
+      updateError.message || "That password could not be accepted. Try a different one."
+    );
+  }
 
   await recordAudit({
     organizationId,
@@ -210,7 +254,12 @@ export async function loginSupplier(
 
   // A supplier whose vendor record was blacklisted or archived loses portal access
   // immediately — the vendor status is the authority, not the portal user row.
-  if (su.vendor.status === "BLACKLISTED" || su.vendor.status === "ARCHIVED") {
+  if (
+    su.vendor.status === "BLACKLISTED" ||
+    su.vendor.status === "ARCHIVED" ||
+    su.vendor.status === "SUSPENDED" ||
+    su.vendor.status === "INACTIVE"
+  ) {
     await recordAudit({
       organizationId: su.organizationId,
       supplierUserId: su.id,

@@ -52,8 +52,10 @@ export function Sidebar({ isOpen, onClose }: { isOpen: boolean; onClose: () => v
     (r) => r.approvals.some((a) => a.decision === "PENDING") && (r.status === "SUBMITTED" || r.status === "UNDER_REVIEW")
   ).length;
 
-  // Waiting RFQs
-  const waitingRfqs = rfqs.filter((r) => r.status === "WAITING").length;
+  // RFQs out with suppliers and still open for responses.
+  const liveRfqs = rfqs.filter(
+    (r) => r.status === "PUBLISHED" || r.status === "RESPONSE_PERIOD"
+  ).length;
 
   const navSections: { label: string; items: NavItem[] }[] = [
     {
@@ -71,7 +73,8 @@ export function Sidebar({ isOpen, onClose }: { isOpen: boolean; onClose: () => v
     {
       label: "Procurement",
       items: [
-        { key: "rfqs", label: "RFQs", icon: FileText, badge: () => waitingRfqs, permission: "rfqs.view" },
+        { key: "rfqs", label: "Sourcing", icon: FileText, badge: () => liveRfqs, permission: "rfqs.view" },
+        { key: "quotations", label: "Quotations", icon: Receipt, permission: "rfqs.view" },
         { key: "purchase-orders", label: "Purchase Orders", icon: Package, permission: "purchaseOrders.view" },
         { key: "goods-receipts", label: "Goods Receiving", icon: Package },
         { key: "contracts", label: "Contracts", icon: FileText },

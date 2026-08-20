@@ -54,8 +54,43 @@ NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY sb_publishable_…
 SUPABASE_SECRET_KEY                 sb_secret_…
 AUTH_SECRET                         <32-byte hex>
 INTEGRATION_ENCRYPTION_KEY          <32-byte hex>
-NEXTAUTH_URL                        https://your-deployment.vercel.app
+NEXT_PUBLIC_SITE_URL                https://your-deployment.vercel.app
 ```
+
+`NEXT_PUBLIC_SITE_URL` is the origin Supabase returns users to from verification
+and recovery emails. Get it wrong and sign-up appears to work while every
+verification link lands on the wrong host — or is refused outright, because
+Supabase only redirects to URLs on the project's allow-list. Set it per
+environment; a preview deployment needs its own.
+
+### 3a. Configure Supabase Auth
+
+Authentication → URL Configuration, in the Supabase dashboard:
+
+| Setting | Value |
+|---|---|
+| Site URL | `https://your-deployment.vercel.app` |
+| Redirect URLs | `https://your-deployment.vercel.app/auth/callback`<br>`https://your-deployment.vercel.app/auth/finish`<br>`http://localhost:3000/auth/callback`<br>`http://localhost:3000/auth/finish` |
+
+Both callback paths must be listed. `/auth/callback` handles links that carry the
+session as a query parameter; `/auth/finish` handles the ones that carry it in the
+URL fragment, which a server can never see. Which of the two Supabase uses depends
+on how the link was generated, so omitting either breaks verification for a subset
+of users — and it fails *after* the address has already been marked confirmed,
+which is the hardest kind of failure to diagnose.
+
+Authentication → Providers → Email:
+
+- **Enable email provider** — on.
+- **Confirm email** — on. With it off, anyone can sign up as any address without
+  proving they control it. `getInternalPrincipal` rejects unverified identities
+  regardless, so turning it off does not grant access; it just strands users.
+
+Authentication → Emails: the built-in SMTP is rate-limited to a few messages per
+hour and, on a new project, delivers only to members of the Supabase organization.
+That is fine for development and **not** fine for production — real sign-ups will
+silently fail to receive anything. Configure a custom SMTP provider before
+inviting real users.
 
 `.env` is gitignored and is **not** in the repository — these must be set here.
 See `.env.example` for the full annotated list.
@@ -65,10 +100,39 @@ See `.env.example` for the full annotated list.
 Run locally, pointed at Supabase:
 
 ```bash
-npm run db:migrate    # applies prisma/migrations in order
-npm run db:harden     # RLS lockdown — required after any migration that adds tables
-npm run db:seed       # demo organization; optional
+npm run db:migrate          # applies prisma/migrations in order
+npm run db:harden           # RLS lockdown — required after any migration that adds tables
+npm run db:seed             # demo organization; optional
+npm run db:link-auth        # gives each seeded user a Supabase Auth identity
+npm run db:sync-roles       # grants newly-released permissions to the system roles
+npm run db:vendor-workflow  # installs the default vendor onboarding approval
 ```
+
+The last two are the ones that are easy to forget on an **upgrade** of a tenant
+that already has data, and both fail loudly rather than subtly if skipped.
+
+`db:sync-roles` exists because `ensureSystemRoles` never rewrites an existing
+role's permissions — that is what lets an administrator remove a grant and have it
+stay removed across deploys. The cost is that a permission added to the catalog in
+a release reaches nobody until this is run, and every call gated on it returns 403,
+including for the organization administrator. Run it after any release that adds
+permissions; `-- --dry-run` prints the diff first. It only ever adds.
+
+`db:vendor-workflow` installs the three-stage supplier onboarding approval as
+ordinary workflow rows and grants the `VENDOR_MANAGER` role its first stage routes
+to. Both are idempotent: an organization that already has a VENDOR workflow keeps
+whatever it has configured. Without it, submitting a supplier for approval refuses
+with a configuration error rather than approving nothing silently.
+
+`db:link-auth` is required after any seed. Supabase Auth holds the credentials,
+so a `User` row without a linked `authUserId` cannot sign in at all — the seed
+alone produces accounts that exist but are unreachable. The script is idempotent
+and safe to re-run.
+
+For a tenant whose real passwords nobody knows, run it as
+`npm run db:link-auth -- --invite` instead: that creates each identity without a
+usable password and sends a recovery link, so users set their own and no operator
+ever learns them.
 
 `db:harden` is not optional housekeeping. Supabase publishes every table in the
 `public` schema through PostgREST, so a table created without row-level security
@@ -98,11 +162,19 @@ Vercel restores a cached `node_modules`.
 
 ```bash
 BASE_URL=https://your-deployment.vercel.app npm run verify:journeys
+BASE_URL=https://your-deployment.vercel.app npm run verify:vendors
+BASE_URL=https://your-deployment.vercel.app npm run verify:sourcing
 ```
 
 The 72 journey checks drive the real API over HTTP and will exercise the deployed
 instance. They create real records, so run them against a staging deployment
 rather than one holding data you care about.
+
+`verify:sourcing` additionally signs in through the **supplier** realm, so it
+proves the second cookie, the second sign-in route and the redaction boundary on
+the deployed instance rather than only in development. It creates its own
+suppliers, portal accounts and an isolation organization, and removes them at the
+end — but a run interrupted part-way leaves them behind.
 
 ---
 

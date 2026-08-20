@@ -20,6 +20,7 @@ import { emit } from "../engines/events";
 import * as budgetEngine from "../engines/budget";
 import { canTransition, transition } from "../state-machine";
 import { enqueue } from "../engines/outbox";
+import { assertTradeable } from "./vendor-service";
 import { orderBy, paginate, scoped, type Page, type ServiceContext } from "./context";
 import type {
   createPoSchema,
@@ -204,9 +205,7 @@ export async function create(ctx: ServiceContext, input: CreateInput) {
 
   const vendor = await tdb.vendor.findUnique({ where: { id: input.vendorId } });
   if (!vendor) throw validation("The selected vendor does not exist");
-  if (vendor.status === "BLACKLISTED") {
-    throw conflict(`${vendor.companyName} is blacklisted — no purchase order may be raised`);
-  }
+  assertTradeable(vendor, "no purchase order may be raised");
   if (vendor.status === "ARCHIVED") {
     throw conflict(`${vendor.companyName} is archived. Reactivate the vendor before ordering.`);
   }
@@ -363,9 +362,7 @@ export async function approve(ctx: ServiceContext, id: string, comment?: string)
       "You raised this purchase order, so you cannot also approve it. Separation of duties requires a second person."
     );
   }
-  if (po.vendor.status === "BLACKLISTED") {
-    throw conflict(`${po.vendor.companyName} is blacklisted — this order cannot be approved`);
-  }
+  assertTradeable(po.vendor, "this order cannot be approved");
 
   const next = transition("purchaseOrder", po.status, "APPROVED");
   await tdb.purchaseOrder.update({
@@ -421,9 +418,7 @@ export async function issue(ctx: ServiceContext, id: string) {
 
   const po = await tdb.purchaseOrder.findUnique({ where: { id }, include: { vendor: true } });
   if (!po) throw notFound("Purchase order not found");
-  if (po.vendor.status === "BLACKLISTED") {
-    throw conflict(`${po.vendor.companyName} is blacklisted — this order cannot be issued`);
-  }
+  assertTradeable(po.vendor, "this order cannot be issued");
 
   // DRAFT → ISSUED is legal for organizations that do not gate POs separately;
   // PENDING_APPROVAL → ISSUED is not, because that order is waiting on a decision

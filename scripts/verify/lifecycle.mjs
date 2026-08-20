@@ -35,6 +35,7 @@ const section = (t) => console.log(`\n\x1b[1m${t}\x1b[0m`);
 class Client {
   constructor(label) {
     this.label = label;
+    this.cookies = new Map();
     this.cookie = "";
   }
   async request(method, path, body) {
@@ -46,10 +47,18 @@ class Client {
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
+    // Supabase issues `sb-<ref>-auth-token`, chunked into `.0`/`.1` when the JWT
+    // exceeds 4KB, so every cookie is kept rather than one fixed name.
     for (const c of res.headers.getSetCookie?.() ?? []) {
       const [pair] = c.split(";");
-      if (pair.startsWith("nextmav.sid=")) this.cookie = pair;
+      const eq = pair.indexOf("=");
+      if (eq < 1) continue;
+      const name = pair.slice(0, eq);
+      const value = pair.slice(eq + 1);
+      if (value === "" || value === "deleted") this.cookies.delete(name);
+      else this.cookies.set(name, value);
     }
+    this.cookie = [...this.cookies].map(([k, v]) => `${k}=${v}`).join("; ");
     let payload = null;
     try {
       payload = await res.json();

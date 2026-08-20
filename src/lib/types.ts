@@ -40,9 +40,117 @@ export type ApprovalDecision =
   | "CHANGES_REQUESTED"
   | "DELEGATED";
 
-export type VendorStatus = "ACTIVE" | "PROSPECTIVE" | "ARCHIVED" | "BLACKLISTED" | "PREFERRED";
+export type VendorStatus =
+  | "PROSPECTIVE"
+  | "INVITED"
+  | "ONBOARDING"
+  | "UNDER_REVIEW"
+  | "PENDING_APPROVAL"
+  | "APPROVED"
+  | "ACTIVE"
+  | "REJECTED"
+  | "SUSPENDED"
+  | "INACTIVE"
+  | "ARCHIVED"
+  | "BLACKLISTED";
 
-export type RFQStatus = "WAITING" | "RECEIVED" | "EXPIRED" | "CLOSED" | "CANCELLED";
+export type VendorType =
+  | "SUPPLIER"
+  | "MANUFACTURER"
+  | "DISTRIBUTOR"
+  | "CONTRACTOR"
+  | "SERVICE_PROVIDER"
+  | "CONSULTANT"
+  | "OTHER";
+
+export type VendorBusinessSize = "MICRO" | "SMALL" | "MEDIUM" | "LARGE" | "ENTERPRISE";
+
+export type VendorComplianceState =
+  | "NOT_STARTED"
+  | "IN_PROGRESS"
+  | "COMPLIANT"
+  | "PARTIALLY_COMPLIANT"
+  | "NON_COMPLIANT"
+  | "EXPIRED"
+  | "UNDER_REVIEW";
+
+export type VendorComplianceType =
+  | "BUSINESS_REGISTRATION"
+  | "TAX_CLEARANCE"
+  | "INSURANCE"
+  | "CERTIFICATION"
+  | "INDUSTRY_LICENCE"
+  | "BANK_VERIFICATION"
+  | "DATA_PROTECTION"
+  | "HEALTH_AND_SAFETY"
+  | "ANTI_BRIBERY"
+  | "OTHER";
+
+export type VendorComplianceStatus =
+  | "NOT_STARTED"
+  | "PENDING_SUBMISSION"
+  | "SUBMITTED"
+  | "UNDER_REVIEW"
+  | "VERIFIED"
+  | "REJECTED"
+  | "EXPIRED"
+  | "WAIVED";
+
+export type VendorContactType =
+  | "GENERAL"
+  | "SALES"
+  | "FINANCE"
+  | "OPERATIONS"
+  | "ACCOUNT_MANAGER"
+  | "EXECUTIVE"
+  | "TECHNICAL"
+  | "SUPPORT";
+
+export type VendorRiskStatus = "UNASSESSED" | "ASSESSED" | "REVIEW_DUE" | "ESCALATED";
+
+export type VendorRiskLevel = "UNRATED" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+
+export type RFQStatus =
+  | "DRAFT"
+  | "UNDER_REVIEW"
+  | "APPROVED"
+  | "READY_TO_PUBLISH"
+  | "PUBLISHED"
+  | "RESPONSE_PERIOD"
+  | "CLOSED"
+  | "UNDER_EVALUATION"
+  | "AWARDED"
+  | "NO_AWARD"
+  | "EXPIRED"
+  | "CANCELLED";
+
+export type SourcingEventStatus =
+  | "DRAFT"
+  | "PLANNING"
+  | "ACTIVE"
+  | "EVALUATION"
+  | "AWARDED"
+  | "CLOSED"
+  | "CANCELLED";
+
+export type QuotationStatus =
+  | "DRAFT"
+  | "SUBMITTED"
+  | "RECEIVED"
+  | "UNDER_EVALUATION"
+  | "SELECTED"
+  | "REJECTED"
+  | "WITHDRAWN"
+  | "SUPERSEDED"
+  | "EXPIRED";
+
+export type RFQInvitationStatus =
+  | "INVITED"
+  | "VIEWED"
+  | "ACCEPTED"
+  | "QUOTED"
+  | "DECLINED"
+  | "NO_RESPONSE";
 
 export type PurchaseOrderStatus =
   | "DRAFT"
@@ -110,10 +218,22 @@ export type Permission =
   | "vendors.create"
   | "vendors.edit"
   | "vendors.archive"
+  | "vendors.approve"
+  | "vendors.suspend"
+  | "vendors.compliance"
+  | "vendors.risk"
+  | "vendors.notes"
+  | "vendors.portal"
   | "rfqs.view"
   | "rfqs.create"
   | "rfqs.issue"
   | "rfqs.cancel"
+  | "rfqs.approve"
+  | "rfqs.evaluate"
+  | "rfqs.manageEvaluation"
+  | "rfqs.clarify"
+  | "rfqs.recommendAward"
+  | "rfqs.approveAward"
   | "rfqs.selectQuotation"
   | "purchaseOrders.view"
   | "purchaseOrders.create"
@@ -171,11 +291,23 @@ export const PERMISSION_LABELS: Record<Permission, { label: string; category: st
   "vendors.create": { label: "Create Vendors", category: "Vendors", description: "Add new vendors to the directory" },
   "vendors.edit": { label: "Edit Vendors", category: "Vendors", description: "Modify vendor information" },
   "vendors.archive": { label: "Archive Vendors", category: "Vendors", description: "Archive or blacklist vendors" },
+  "vendors.approve": { label: "Approve Vendors", category: "Vendors", description: "Decide vendor onboarding approvals and activate approved vendors" },
+  "vendors.suspend": { label: "Suspend Vendors", category: "Vendors", description: "Suspend, reactivate or deactivate a trading relationship" },
+  "vendors.compliance": { label: "Manage Vendor Compliance", category: "Vendors", description: "Set compliance requirements and verify supporting documents" },
+  "vendors.risk": { label: "Assess Vendor Risk", category: "Vendors", description: "Record vendor risk assessments and review dates" },
+  "vendors.notes": { label: "Vendor Internal Notes", category: "Vendors", description: "Read and write internal notes on a vendor" },
+  "vendors.portal": { label: "Manage Supplier Portal Access", category: "Vendors", description: "Invite, suspend and revoke supplier portal logins" },
   "rfqs.view": { label: "View RFQs", category: "RFQs", description: "View all RFQs" },
   "rfqs.create": { label: "Create RFQs", category: "RFQs", description: "Create new RFQs" },
   "rfqs.issue": { label: "Issue RFQs", category: "RFQs", description: "Send RFQs to vendors" },
   "rfqs.cancel": { label: "Cancel RFQs", category: "RFQs", description: "Cancel pending RFQs" },
-  "rfqs.selectQuotation": { label: "Select Quotation", category: "RFQs", description: "Select winning quotation" },
+  "rfqs.approve": { label: "Approve RFQs", category: "RFQs", description: "Decide the approval that gates an RFQ before it can be published" },
+  "rfqs.evaluate": { label: "Score Quotations", category: "RFQs", description: "Score bids against the criteria the evaluator is assigned to" },
+  "rfqs.manageEvaluation": { label: "Manage Evaluation", category: "RFQs", description: "Define evaluation criteria, appoint the panel, and see every evaluator's scores" },
+  "rfqs.clarify": { label: "Answer Clarifications", category: "RFQs", description: "Answer supplier questions and issue notices to invited suppliers" },
+  "rfqs.recommendAward": { label: "Recommend Award", category: "RFQs", description: "Put forward a supplier for award on the evidence of the evaluation" },
+  "rfqs.approveAward": { label: "Approve Award", category: "RFQs", description: "Decide the approval on an award recommendation" },
+  "rfqs.selectQuotation": { label: "Select Quotation", category: "RFQs", description: "Record the award against the winning quotation" },
   "purchaseOrders.view": { label: "View Purchase Orders", category: "Purchase Orders", description: "View all POs" },
   "purchaseOrders.create": { label: "Generate Purchase Orders", category: "Purchase Orders", description: "Generate POs from approved RFQs" },
   "purchaseOrders.issue": { label: "Issue Purchase Orders", category: "Purchase Orders", description: "Send POs to vendors" },
@@ -225,7 +357,10 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
   PROCUREMENT_MANAGER: [
     "requests.view", "requests.create", "requests.edit.all", "requests.cancel", "requests.approve", "requests.reject", "requests.comment",
     "vendors.view", "vendors.create", "vendors.edit", "vendors.archive",
+    "vendors.approve", "vendors.suspend", "vendors.compliance", "vendors.risk", "vendors.notes", "vendors.portal",
     "rfqs.view", "rfqs.create", "rfqs.issue", "rfqs.cancel", "rfqs.selectQuotation",
+    "rfqs.approve", "rfqs.evaluate", "rfqs.manageEvaluation", "rfqs.clarify",
+    "rfqs.recommendAward", "rfqs.approveAward",
     "purchaseOrders.view", "purchaseOrders.create", "purchaseOrders.issue", "purchaseOrders.cancel", "purchaseOrders.updateStatus", "purchaseOrders.approve",
     "goodsReceipts.view", "goodsReceipts.create", "goodsReceipts.post",
     "invoices.view", "invoices.create", "invoices.match",
@@ -238,7 +373,10 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
   ],
   FINANCE_OFFICER: [
     "requests.view", "requests.approve", "requests.reject", "requests.comment",
-    "vendors.view", "rfqs.view", "purchaseOrders.view",
+    // Finance sits on the vendor onboarding workflow: it is the stage that checks
+    // banking details and tax standing before a supplier can be paid.
+    "vendors.view", "vendors.approve", "vendors.notes",
+    "rfqs.view", "rfqs.evaluate", "rfqs.approveAward", "purchaseOrders.view",
     "goodsReceipts.view",
     "invoices.view", "invoices.create", "invoices.match", "invoices.approve", "invoices.reject",
     "payments.view", "payments.create", "payments.approve", "payments.process", "payments.reconcile",
@@ -248,7 +386,7 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
   ],
   DEPARTMENT_MANAGER: [
     "requests.view", "requests.create", "requests.edit.own", "requests.cancel", "requests.approve", "requests.reject", "requests.comment",
-    "vendors.view", "rfqs.view", "purchaseOrders.view",
+    "vendors.view", "rfqs.view", "rfqs.evaluate", "purchaseOrders.view",
     "goodsReceipts.view", "invoices.view", "payments.view",
     "inventory.view", "assets.view", "contracts.view", "documents.view",
     "reports.view", "budgets.view",
@@ -332,25 +470,147 @@ export interface VendorDocument {
   name: string;
   fileName: string;
   fileSize: string;
+  documentNumber?: string;
+  issuedAt?: string;
   uploadedAt: string;
   expiresAt?: string;
   status: "VALID" | "EXPIRING" | "EXPIRED" | "PENDING_REVIEW";
+  version: number;
+  uploadedById?: string;
+  verifiedById?: string;
+  verifiedAt?: string;
+  rejectedReason?: string;
+  notes?: string;
+  /** Days until expiry; negative once lapsed. Derived server-side, never stored. */
+  daysToExpiry?: number;
+}
+
+export interface VendorContact {
+  id: string;
+  vendorId: string;
+  name: string;
+  email?: string;
+  phone?: string;
+  jobTitle?: string;
+  department?: string;
+  type: VendorContactType;
+  isPrimary: boolean;
+  isActive: boolean;
+  notes?: string;
+  createdAt: string;
+}
+
+export interface VendorComplianceRequirement {
+  id: string;
+  vendorId: string;
+  type: VendorComplianceType;
+  name: string;
+  description?: string;
+  status: VendorComplianceStatus;
+  isMandatory: boolean;
+  documentId?: string;
+  documentName?: string;
+  expiresAt?: string;
+  submittedAt?: string;
+  reviewedAt?: string;
+  reviewedById?: string;
+  reviewNotes?: string;
+  waivedById?: string;
+  waivedReason?: string;
+  daysToExpiry?: number;
+  createdAt: string;
+}
+
+export interface VendorCategoryLink {
+  id: string;
+  vendorId: string;
+  categoryId: string;
+  categoryName: string;
+  categoryCode: string;
+  isPreferred: boolean;
+}
+
+export interface VendorNote {
+  id: string;
+  vendorId: string;
+  authorId?: string;
+  body: string;
+  visibility: "INTERNAL" | "RESTRICTED";
+  isPinned: boolean;
+  createdAt: string;
+}
+
+export interface VendorRiskAssessment {
+  id: string;
+  vendorId: string;
+  level: VendorRiskLevel;
+  score: number;
+  factors?: Record<string, number>;
+  summary?: string;
+  assessedById?: string;
+  assessedAt: string;
+  nextReviewAt?: string;
 }
 
 export interface Vendor {
   id: string;
   organizationId: string;
   companyName: string;
+  legalName?: string;
+  tradingName?: string;
+  vendorType: VendorType;
+  description?: string;
   contactPerson: string;
   email: string;
   phone: string;
   address: string;
+  city?: string;
+  stateRegion?: string;
+  postalCode?: string;
+  country?: string;
   category: string;
   taxNumber: string;
+  registrationNumber?: string;
+  businessClassification?: string;
+  businessSize?: VendorBusinessSize;
+  incorporatedOn?: string;
+  website?: string;
+  code?: string;
+  leadTimeDays?: number;
+  minimumOrderValue?: number;
   bankName: string;
   bankAccount: string;
   rating: number;
   status: VendorStatus;
+  isPreferred: boolean;
+  complianceState: VendorComplianceState;
+  riskLevel: VendorRiskLevel;
+  riskScore?: number;
+  riskStatus: VendorRiskStatus;
+  riskReviewedAt?: string;
+  riskNextReviewAt?: string;
+  onboardedAt?: string;
+  invitedAt?: string;
+  onboardingStartedAt?: string;
+  submittedForReviewAt?: string;
+  approvedAt?: string;
+  approvedById?: string;
+  rejectedAt?: string;
+  rejectedReason?: string;
+  activatedAt?: string;
+  deactivatedAt?: string;
+  deactivatedReason?: string;
+  archivedAt?: string;
+  suspendedAt?: string;
+  suspendedReason?: string;
+  blacklistedAt?: string;
+  blacklistedReason?: string;
+  createdById?: string;
+  contacts: VendorContact[];
+  categories: VendorCategoryLink[];
+  compliance: VendorComplianceRequirement[];
+  performanceUpdatedAt?: string;
+  updatedAt?: string;
   totalOrders: number;
   totalValue: number;
   paymentTerms: string;
@@ -1020,19 +1280,102 @@ export const PO_STATUS_META: Record<PurchaseOrderStatus, { label: string; color:
 };
 
 export const RFQ_STATUS_META: Record<RFQStatus, { label: string; color: string; dot: string }> = {
-  WAITING: { label: "Waiting", color: "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900", dot: "bg-amber-500" },
-  RECEIVED: { label: "Received", color: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900", dot: "bg-emerald-500" },
+  DRAFT: { label: "Draft", color: "bg-muted text-muted-foreground border-border", dot: "bg-muted-foreground/40" },
+  UNDER_REVIEW: { label: "Under Review", color: "bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-900", dot: "bg-violet-500" },
+  APPROVED: { label: "Approved", color: "bg-teal-50 text-teal-700 border-teal-200 dark:bg-teal-950/40 dark:text-teal-300 dark:border-teal-900", dot: "bg-teal-500" },
+  READY_TO_PUBLISH: { label: "Ready to Publish", color: "bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-950/40 dark:text-indigo-300 dark:border-indigo-900", dot: "bg-indigo-500" },
+  PUBLISHED: { label: "Published", color: "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900", dot: "bg-amber-500" },
+  RESPONSE_PERIOD: { label: "Responses In", color: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900", dot: "bg-emerald-500" },
+  CLOSED: { label: "Closed", color: "bg-sky-50 text-sky-700 border-sky-200 dark:bg-sky-950/40 dark:text-sky-300 dark:border-sky-900", dot: "bg-sky-500" },
+  UNDER_EVALUATION: { label: "Under Evaluation", color: "bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-900", dot: "bg-violet-500" },
+  AWARDED: { label: "Awarded", color: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900", dot: "bg-emerald-600" },
+  NO_AWARD: { label: "No Award", color: "bg-muted text-muted-foreground border-border", dot: "bg-muted-foreground/30" },
   EXPIRED: { label: "Expired", color: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900", dot: "bg-rose-500" },
+  CANCELLED: { label: "Cancelled", color: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900", dot: "bg-rose-500" },
+};
+
+// Sourcing events read cooler than the RFQ inside them: the event is a container
+// for the process, and its badge must not compete for attention with the status
+// of the document suppliers are actually holding.
+export const SOURCING_EVENT_STATUS_META: Record<SourcingEventStatus, { label: string; color: string; dot: string }> = {
+  DRAFT: { label: "Draft", color: "bg-muted text-muted-foreground border-border", dot: "bg-muted-foreground/40" },
+  PLANNING: { label: "Planning", color: "bg-sky-50 text-sky-700 border-sky-200 dark:bg-sky-950/40 dark:text-sky-300 dark:border-sky-900", dot: "bg-sky-500" },
+  ACTIVE: { label: "Active", color: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900", dot: "bg-emerald-500" },
+  EVALUATION: { label: "Evaluation", color: "bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-900", dot: "bg-violet-500" },
+  AWARDED: { label: "Awarded", color: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900", dot: "bg-emerald-600" },
   CLOSED: { label: "Closed", color: "bg-muted text-muted-foreground border-border", dot: "bg-muted-foreground/30" },
   CANCELLED: { label: "Cancelled", color: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900", dot: "bg-rose-500" },
 };
 
+export const QUOTATION_STATUS_META: Record<QuotationStatus, { label: string; color: string; dot: string }> = {
+  DRAFT: { label: "Draft", color: "bg-muted text-muted-foreground border-border", dot: "bg-muted-foreground/40" },
+  SUBMITTED: { label: "Submitted", color: "bg-sky-50 text-sky-700 border-sky-200 dark:bg-sky-950/40 dark:text-sky-300 dark:border-sky-900", dot: "bg-sky-500" },
+  RECEIVED: { label: "Received", color: "bg-sky-50 text-sky-700 border-sky-200 dark:bg-sky-950/40 dark:text-sky-300 dark:border-sky-900", dot: "bg-sky-500" },
+  UNDER_EVALUATION: { label: "Under Evaluation", color: "bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-900", dot: "bg-violet-500" },
+  SELECTED: { label: "Awarded", color: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900", dot: "bg-emerald-600" },
+  REJECTED: { label: "Unsuccessful", color: "bg-muted text-muted-foreground border-border", dot: "bg-muted-foreground/30" },
+  WITHDRAWN: { label: "Withdrawn", color: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900", dot: "bg-rose-500" },
+  SUPERSEDED: { label: "Superseded", color: "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900", dot: "bg-amber-500" },
+  EXPIRED: { label: "Expired", color: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900", dot: "bg-rose-500" },
+};
+
+// Where each invited supplier stands. INVITED → VIEWED → ACCEPTED → QUOTED is the
+// happy path; DECLINED and NO_RESPONSE are the two ways it ends without a bid.
+export const RFQ_INVITATION_STATUS_META: Record<RFQInvitationStatus, { label: string; color: string; dot: string }> = {
+  INVITED: { label: "Invited", color: "bg-muted text-muted-foreground border-border", dot: "bg-muted-foreground/40" },
+  VIEWED: { label: "Viewed", color: "bg-sky-50 text-sky-700 border-sky-200 dark:bg-sky-950/40 dark:text-sky-300 dark:border-sky-900", dot: "bg-sky-500" },
+  ACCEPTED: { label: "Accepted", color: "bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-950/40 dark:text-indigo-300 dark:border-indigo-900", dot: "bg-indigo-500" },
+  QUOTED: { label: "Quoted", color: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900", dot: "bg-emerald-500" },
+  DECLINED: { label: "Declined", color: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900", dot: "bg-rose-500" },
+  NO_RESPONSE: { label: "No Response", color: "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900", dot: "bg-amber-500" },
+};
+
+// Onboarding states read cool (sky/indigo), trading states read positive
+// (emerald), interrupted states read cautionary (amber), and states that bar
+// trading read negative (rose). The palette is the existing product's — this
+// extends it across the new lifecycle rather than introducing a second one.
 export const VENDOR_STATUS_META: Record<VendorStatus, { label: string; color: string; dot: string }> = {
-  ACTIVE: { label: "Active", color: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900", dot: "bg-emerald-500" },
   PROSPECTIVE: { label: "Prospective", color: "bg-sky-50 text-sky-700 border-sky-200 dark:bg-sky-950/40 dark:text-sky-300 dark:border-sky-900", dot: "bg-sky-500" },
+  INVITED: { label: "Invited", color: "bg-sky-50 text-sky-700 border-sky-200 dark:bg-sky-950/40 dark:text-sky-300 dark:border-sky-900", dot: "bg-sky-400" },
+  ONBOARDING: { label: "Onboarding", color: "bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-950/40 dark:text-indigo-300 dark:border-indigo-900", dot: "bg-indigo-500" },
+  UNDER_REVIEW: { label: "Under Review", color: "bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-900", dot: "bg-violet-500" },
+  PENDING_APPROVAL: { label: "Pending Approval", color: "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900", dot: "bg-amber-500" },
+  APPROVED: { label: "Approved", color: "bg-teal-50 text-teal-700 border-teal-200 dark:bg-teal-950/40 dark:text-teal-300 dark:border-teal-900", dot: "bg-teal-500" },
+  ACTIVE: { label: "Active", color: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900", dot: "bg-emerald-500" },
+  REJECTED: { label: "Rejected", color: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900", dot: "bg-rose-400" },
+  SUSPENDED: { label: "Suspended", color: "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900", dot: "bg-amber-600" },
+  INACTIVE: { label: "Inactive", color: "bg-muted text-muted-foreground border-border", dot: "bg-muted-foreground/60" },
   ARCHIVED: { label: "Archived", color: "bg-muted text-muted-foreground border-border", dot: "bg-muted-foreground/40" },
   BLACKLISTED: { label: "Blacklisted", color: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900", dot: "bg-rose-500" },
-  PREFERRED: { label: "Preferred", color: "bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-900", dot: "bg-violet-500" },
+};
+
+export const VENDOR_COMPLIANCE_META: Record<VendorComplianceState, { label: string; color: string; dot: string }> = {
+  NOT_STARTED: { label: "Not Started", color: "bg-muted text-muted-foreground border-border", dot: "bg-muted-foreground/40" },
+  IN_PROGRESS: { label: "In Progress", color: "bg-sky-50 text-sky-700 border-sky-200 dark:bg-sky-950/40 dark:text-sky-300 dark:border-sky-900", dot: "bg-sky-500" },
+  UNDER_REVIEW: { label: "Under Review", color: "bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-900", dot: "bg-violet-500" },
+  COMPLIANT: { label: "Compliant", color: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900", dot: "bg-emerald-500" },
+  PARTIALLY_COMPLIANT: { label: "Partially Compliant", color: "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900", dot: "bg-amber-500" },
+  NON_COMPLIANT: { label: "Non-Compliant", color: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900", dot: "bg-rose-500" },
+  EXPIRED: { label: "Expired", color: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900", dot: "bg-rose-400" },
+};
+
+export const VENDOR_RISK_META: Record<VendorRiskLevel, { label: string; color: string; dot: string }> = {
+  UNRATED: { label: "Unrated", color: "bg-muted text-muted-foreground border-border", dot: "bg-muted-foreground/40" },
+  LOW: { label: "Low Risk", color: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900", dot: "bg-emerald-500" },
+  MEDIUM: { label: "Medium Risk", color: "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900", dot: "bg-amber-500" },
+  HIGH: { label: "High Risk", color: "bg-orange-50 text-orange-700 border-orange-200 dark:bg-orange-950/40 dark:text-orange-300 dark:border-orange-900", dot: "bg-orange-500" },
+  CRITICAL: { label: "Critical Risk", color: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900", dot: "bg-rose-500" },
+};
+
+export const VENDOR_COMPLIANCE_ITEM_META: Record<VendorComplianceStatus, { label: string; color: string; dot: string }> = {
+  NOT_STARTED: { label: "Not Started", color: "bg-muted text-muted-foreground border-border", dot: "bg-muted-foreground/40" },
+  PENDING_SUBMISSION: { label: "Awaiting Evidence", color: "bg-sky-50 text-sky-700 border-sky-200 dark:bg-sky-950/40 dark:text-sky-300 dark:border-sky-900", dot: "bg-sky-500" },
+  SUBMITTED: { label: "Submitted", color: "bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-950/40 dark:text-indigo-300 dark:border-indigo-900", dot: "bg-indigo-500" },
+  UNDER_REVIEW: { label: "Under Review", color: "bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-900", dot: "bg-violet-500" },
+  VERIFIED: { label: "Verified", color: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900", dot: "bg-emerald-500" },
+  REJECTED: { label: "Rejected", color: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900", dot: "bg-rose-500" },
+  EXPIRED: { label: "Expired", color: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900", dot: "bg-rose-400" },
+  WAIVED: { label: "Waived", color: "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900", dot: "bg-amber-500" },
 };
 
 export const CURRENCY_META: Record<Currency, { symbol: string; label: string; flag: string }> = {

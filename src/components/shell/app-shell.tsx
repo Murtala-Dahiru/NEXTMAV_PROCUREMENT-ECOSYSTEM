@@ -21,6 +21,7 @@ import { VendorsView } from "@/components/views/vendors-view";
 import { VendorDetailView } from "@/components/views/vendor-detail-view";
 import { SupplierPortalView } from "@/components/views/supplier-portal-view";
 import { RfqsView } from "@/components/views/rfqs-view";
+import { QuotationsView } from "@/components/views/quotations-view";
 import { RfqDetailView } from "@/components/views/rfq-detail-view";
 import { RfqFormView } from "@/components/views/rfq-form-view";
 import { PurchaseOrdersView } from "@/components/views/purchase-orders-view";
@@ -61,6 +62,7 @@ export function AppShell() {
       case "vendor-detail": return <VendorDetailView />;
       case "supplier-portal": return <SupplierPortalView />;
       case "rfqs": return <RfqsView />;
+      case "quotations": return <QuotationsView />;
       case "rfq-detail": return <RfqDetailView />;
       case "rfq-new": return <RfqFormView />;
       case "purchase-orders": return <PurchaseOrdersView />;

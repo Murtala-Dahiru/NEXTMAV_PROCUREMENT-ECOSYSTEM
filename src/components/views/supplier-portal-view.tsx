@@ -96,7 +96,7 @@ export function SupplierPortalView() {
         <KpiCard label="Active Suppliers" value={activeCount} icon={Users} iconBg="bg-emerald-100 dark:bg-emerald-950/40" />
         <KpiCard label="Pending Invites" value={pendingCount} icon={Clock} iconBg="bg-amber-100 dark:bg-amber-950/40" />
         <KpiCard label="Total Supplier Spend" value={formatCompactCurrency(totalSupplierValue)} icon={TrendingUp} iconBg="bg-sky-100 dark:bg-sky-950/40" />
-        <KpiCard label="Open RFQs" value={rfqs.filter((r) => r.status === "WAITING").length} icon={ShoppingBag} iconBg="bg-violet-100 dark:bg-violet-950/40" />
+        <KpiCard label="Open RFQs" value={rfqs.filter((r) => r.status === "PUBLISHED" || r.status === "RESPONSE_PERIOD").length} icon={ShoppingBag} iconBg="bg-violet-100 dark:bg-violet-950/40" />
       </div>
 
       {/* What suppliers can do */}

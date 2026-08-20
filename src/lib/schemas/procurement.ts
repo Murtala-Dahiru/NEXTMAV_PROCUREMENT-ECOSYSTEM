@@ -90,39 +90,185 @@ export const listQuerySchema = z.object({
 export type ListQuery = z.infer<typeof listQuerySchema>;
 
 // ---------------------------------------------------------------------------
+// Sourcing events
+// ---------------------------------------------------------------------------
+
+const isoDate = z.string().datetime({ offset: true }).or(z.string().date());
+
+export const SOURCING_EVENT_TYPES = ["RFQ", "RFP", "RFI", "TENDER", "DIRECT_AWARD"] as const;
+
+export const createSourcingEventSchema = z.object({
+  title: z.string().trim().min(3, "Give the event a title").max(200),
+  description: z.string().trim().max(5000).optional().default(""),
+  /** The approved purchase request this event exists to satisfy. */
+  requestId: z.string().optional(),
+  categoryId: z.string().optional(),
+  ownerId: z.string().optional(),
+  type: z.enum(SOURCING_EVENT_TYPES).default("RFQ"),
+  currency: z.string().trim().length(3).default("USD"),
+  estimatedValue: money.optional(),
+  responseDeadline: isoDate.optional(),
+});
+
+export const updateSourcingEventSchema = createSourcingEventSchema
+  .partial()
+  .omit({ requestId: true, type: true });
+
+// ---------------------------------------------------------------------------
 // RFQ / sourcing
 // ---------------------------------------------------------------------------
 
 export const rfqLineItemSchema = z.object({
+  /** Present when editing an existing line; absent when adding one. */
+  id: z.string().optional(),
   itemName: z.string().trim().min(1).max(200),
   description: z.string().trim().max(2000).optional().default(""),
+  specification: z.string().trim().max(8000).optional().default(""),
   quantity: positiveQty,
   unit: z.string().trim().min(1).max(40).default("unit"),
+  requiredDeliveryDate: isoDate.optional(),
+  /** Internal reference price. Never returned to a supplier unless the RFQ says so. */
+  targetPrice: money.optional(),
+  notes: z.string().trim().max(2000).optional().default(""),
+  requestLineItemId: z.string().optional(),
 });
+
+export const EVALUATION_CRITERION_TYPES = [
+  "PRICE",
+  "DELIVERY",
+  "QUALITY",
+  "COMPLIANCE",
+  "WARRANTY",
+  "EXPERIENCE",
+  "TECHNICAL",
+  "SERVICE_LEVEL",
+  "RISK",
+  "OTHER",
+] as const;
 
 export const rfqCriterionSchema = z.object({
+  id: z.string().optional(),
   name: z.string().trim().min(1).max(120),
-  type: z
-    .enum(["PRICE", "DELIVERY", "QUALITY", "COMPLIANCE", "WARRANTY", "EXPERIENCE", "OTHER"])
-    .default("OTHER"),
-  weight: z.number().min(0).max(100).default(1),
+  description: z.string().trim().max(1000).optional().default(""),
+  type: z.enum(EVALUATION_CRITERION_TYPES).default("OTHER"),
+  /** Percentage weight. The set must total 100 before the RFQ can be published. */
+  weight: z.number().min(0).max(100).default(0),
   lowerIsBetter: z.boolean().default(false),
   maxScore: z.number().min(1).max(100).default(10),
+  isAutomatic: z.boolean().default(false),
 });
 
+export const EVALUATOR_ROLES = [
+  "PROCUREMENT",
+  "TECHNICAL",
+  "FINANCE",
+  "DEPARTMENT",
+  "EXECUTIVE",
+] as const;
+
+export const rfqEvaluatorSchema = z.object({
+  userId: z.string().min(1),
+  role: z.enum(EVALUATOR_ROLES).default("PROCUREMENT"),
+  isChair: z.boolean().default(false),
+});
+
+export const RFQ_EVALUATION_METHODS = [
+  "LOWEST_PRICE",
+  "WEIGHTED_SCORE",
+  "QUALITY_THEN_PRICE",
+] as const;
+
 export const createRfqSchema = z.object({
+  /** Existing event to attach this RFQ to. One is created when absent. */
+  sourcingEventId: z.string().optional(),
   title: z.string().trim().min(3).max(200),
   description: z.string().trim().max(5000).optional().default(""),
-  deadline: z.string().datetime({ offset: true }).or(z.string().date()),
+  referenceNumber: z.string().trim().max(60).optional(),
+  deadline: isoDate,
+  questionDeadline: isoDate.optional(),
+  requiredDeliveryDate: isoDate.optional(),
+  deliveryTerms: z.string().trim().max(2000).optional(),
+  deliveryAddress: z.string().trim().max(500).optional(),
+  termsAndConditions: z.string().trim().max(20000).optional(),
   requestId: z.string().optional(),
-  invitedVendorIds: z.array(z.string()).min(1, "Invite at least one supplier").max(50),
+  categoryId: z.string().optional(),
+  currency: z.string().trim().length(3).default("USD"),
+  estimatedValue: money.optional(),
+  showTargetPrice: z.boolean().default(false),
+  isSealed: z.boolean().default(false),
+  allowSupplierRevision: z.boolean().default(false),
+  evaluationMethod: z.enum(RFQ_EVALUATION_METHODS).default("LOWEST_PRICE"),
+  /** Optional at draft time; required before publication. */
+  invitedVendorIds: z.array(z.string()).max(100).default([]),
   // Optional: when an RFQ is raised from an approved request, the lines are
   // derived from that request rather than re-keyed.
   lineItems: z.array(rfqLineItemSchema).max(200).optional(),
   // Defined before bids arrive, so the yardstick cannot be chosen after seeing
   // the numbers.
   criteria: z.array(rfqCriterionSchema).max(20).optional(),
+  evaluators: z.array(rfqEvaluatorSchema).max(20).optional(),
 });
+
+/**
+ * Editing a draft RFQ. `requestId` is deliberately not editable: re-pointing an
+ * RFQ at a different requirement after the fact is how traceability is lost.
+ */
+export const updateRfqSchema = createRfqSchema
+  .partial()
+  .omit({ requestId: true, sourcingEventId: true, invitedVendorIds: true });
+
+export const rfqLineItemsSchema = z.object({
+  lineItems: z.array(rfqLineItemSchema).min(1, "An RFQ needs at least one line item").max(200),
+});
+
+export const rfqCriteriaSchema = z.object({
+  criteria: z.array(rfqCriterionSchema).max(20),
+});
+
+export const rfqEvaluatorsSchema = z.object({
+  evaluators: z.array(rfqEvaluatorSchema).max(20),
+});
+
+export const inviteSuppliersSchema = z.object({
+  vendorIds: z.array(z.string()).min(1, "Select at least one supplier").max(100),
+});
+
+export const eligibleSupplierQuerySchema = z.object({
+  search: z.string().trim().max(200).optional(),
+  categoryId: z.string().trim().max(60).optional(),
+  country: z.string().trim().max(80).optional(),
+  /** Filter to suppliers whose compliance is clear. */
+  compliantOnly: z.coerce.boolean().default(false),
+  /** Highest acceptable risk level. */
+  maxRisk: z.enum(["UNRATED", "LOW", "MEDIUM", "HIGH", "CRITICAL"]).optional(),
+  /** Only suppliers the organization has previously traded with. */
+  existingOnly: z.coerce.boolean().default(false),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+
+export const publishRfqSchema = z.object({
+  /** Acknowledges publishing without an approval, where none is configured. */
+  note: z.string().trim().max(500).optional(),
+});
+
+export const closeRfqSchema = z.object({
+  reason: z.string().trim().max(500).optional().default(""),
+});
+
+export const rfqDecisionSchema = z.object({
+  stepId: z.string().min(1),
+  decision: z.enum(["APPROVED", "REJECTED"]),
+  comment: z.string().trim().max(2000).optional().default(""),
+});
+
+export const allowRevisionSchema = z.object({
+  vendorId: z.string().min(1),
+  reason: z.string().trim().min(1, "Say why a revision is being invited").max(500),
+});
+
+// ---------------------------------------------------------------------------
+// Quotations
+// ---------------------------------------------------------------------------
 
 export const quotationLineItemSchema = z.object({
   rfqLineItemId: z.string().optional(),
@@ -131,21 +277,79 @@ export const quotationLineItemSchema = z.object({
   quantity: positiveQty,
   unit: z.string().trim().min(1).max(40).default("unit"),
   unitPrice: money,
+  discountPercent: z.number().min(0).max(100).default(0),
   taxRate: z.number().min(0).max(100).default(0),
+  deliveryCost: money.default(0),
+  deliveryDays: z.number().int().min(0).max(3650).optional(),
+  isAlternative: z.boolean().default(false),
+  isNoBid: z.boolean().default(false),
+  notes: z.string().trim().max(1000).optional().default(""),
 });
 
-export const submitQuotationSchema = z.object({
-  deliveryDays: z.number().int().min(0).max(3650),
+/**
+ * A quotation as the supplier is working on it.
+ *
+ * Everything is optional except the lines, because a draft is allowed to be
+ * incomplete — that is the entire point of a draft. Completeness is enforced at
+ * submission, not at save.
+ */
+export const saveQuotationDraftSchema = z.object({
+  deliveryDays: z.number().int().min(0).max(3650).default(0),
   warranty: z.string().trim().max(500).optional().default(""),
   paymentTerms: z.string().trim().max(200).optional().default(""),
-  validUntil: z.string().datetime({ offset: true }).or(z.string().date()).optional(),
-  notes: z.string().trim().max(2000).optional().default(""),
-  lineItems: z.array(quotationLineItemSchema).min(1).max(200),
+  validUntil: isoDate.optional(),
+  validityDays: z.number().int().min(1).max(3650).optional(),
+  supplierReference: z.string().trim().max(80).optional(),
+  notes: z.string().trim().max(4000).optional().default(""),
+  discountAmount: money.default(0),
+  shippingAmount: money.default(0),
+  lineItems: z.array(quotationLineItemSchema).max(200).default([]),
 });
 
+/** Submission requires at least one line; the rest is checked in the service. */
+export const submitQuotationSchema = saveQuotationDraftSchema.extend({
+  lineItems: z.array(quotationLineItemSchema).min(1, "Price at least one line").max(200),
+});
+
+export const declineInvitationSchema = z.object({
+  reason: z.string().trim().min(1, "Tell the buyer why").max(1000),
+});
+
+export const withdrawQuotationSchema = z.object({
+  reason: z.string().trim().min(1, "Say why the quotation is being withdrawn").max(1000),
+});
+
+// ---------------------------------------------------------------------------
+// Clarifications
+// ---------------------------------------------------------------------------
+
+export const askClarificationSchema = z.object({
+  question: z.string().trim().min(5, "Ask a question of at least 5 characters").max(4000),
+});
+
+export const answerClarificationSchema = z.object({
+  answer: z.string().trim().min(1, "An answer cannot be empty").max(8000),
+  /**
+   * ALL_SUPPLIERS turns the answer into a notice every invited supplier can read.
+   * Used when the answer changes a requirement — §19.
+   */
+  visibility: z.enum(["PRIVATE", "ALL_SUPPLIERS"]).default("PRIVATE"),
+});
+
+export const issueNoticeSchema = z.object({
+  question: z.string().trim().min(3).max(400),
+  answer: z.string().trim().min(1).max(8000),
+});
+
+// ---------------------------------------------------------------------------
+// Evaluation and award
+// ---------------------------------------------------------------------------
+
 export const evaluateQuotationSchema = z.object({
-  evaluationScore: z.number().min(0).max(100),
+  evaluationScore: z.number().min(0).max(100).optional(),
   evaluationNotes: z.string().trim().max(2000).optional().default(""),
+  isCompliant: z.boolean().optional(),
+  complianceNotes: z.string().trim().max(2000).optional(),
   // Per-criterion scoring. The weighted total is derived from these, never sent
   // by the client — a caller cannot assert the score that wins the award.
   criterionScores: z
@@ -160,9 +364,43 @@ export const evaluateQuotationSchema = z.object({
     .optional(),
 });
 
+export const awardRecommendationItemSchema = z.object({
+  rfqLineItemId: z.string().optional(),
+  quotationLineItemId: z.string().optional(),
+  quantity: positiveQty,
+  unitPrice: money,
+});
+
+export const createAwardRecommendationSchema = z.object({
+  quotationId: z.string().min(1, "Select the quotation being recommended"),
+  type: z.enum(["FULL", "PARTIAL"]).default("FULL"),
+  justification: z
+    .string()
+    .trim()
+    .min(10, "Explain why this supplier is being recommended")
+    .max(4000),
+  /** Required for a partial award; ignored for a full one. */
+  items: z.array(awardRecommendationItemSchema).max(200).optional(),
+  /** true submits it into the approval chain immediately. */
+  submit: z.boolean().default(false),
+});
+
+export const awardDecisionSchema = z.object({
+  stepId: z.string().min(1),
+  decision: z.enum(["APPROVED", "REJECTED"]),
+  comment: z.string().trim().max(2000).optional().default(""),
+});
+
 export const awardRfqSchema = z.object({
-  quotationId: z.string().min(1, "Select the winning quotation"),
-  justification: z.string().trim().max(2000).optional().default(""),
+  /** Either award straight from an approved recommendation… */
+  recommendationId: z.string().optional(),
+  /** …or name the winning quotation directly, where no approval is required. */
+  quotationId: z.string().optional(),
+  justification: z.string().trim().max(4000).optional().default(""),
+});
+
+export const noAwardSchema = z.object({
+  reason: z.string().trim().min(5, "Record why no award is being made").max(2000),
 });
 
 // ---------------------------------------------------------------------------
@@ -314,34 +552,268 @@ export const settlePaymentSchema = z.object({
 // ---------------------------------------------------------------------------
 
 export const VENDOR_STATUSES = [
-  "ACTIVE",
   "PROSPECTIVE",
+  "INVITED",
+  "ONBOARDING",
+  "UNDER_REVIEW",
+  "PENDING_APPROVAL",
+  "APPROVED",
+  "ACTIVE",
+  "REJECTED",
+  "SUSPENDED",
+  "INACTIVE",
   "ARCHIVED",
   "BLACKLISTED",
-  "PREFERRED",
 ] as const;
+
+export const VENDOR_TYPES = [
+  "SUPPLIER",
+  "MANUFACTURER",
+  "DISTRIBUTOR",
+  "CONTRACTOR",
+  "SERVICE_PROVIDER",
+  "CONSULTANT",
+  "OTHER",
+] as const;
+
+export const VENDOR_BUSINESS_SIZES = ["MICRO", "SMALL", "MEDIUM", "LARGE", "ENTERPRISE"] as const;
+
+export const VENDOR_CONTACT_TYPES = [
+  "GENERAL",
+  "SALES",
+  "FINANCE",
+  "OPERATIONS",
+  "ACCOUNT_MANAGER",
+  "EXECUTIVE",
+  "TECHNICAL",
+  "SUPPORT",
+] as const;
+
+export const VENDOR_COMPLIANCE_TYPES = [
+  "BUSINESS_REGISTRATION",
+  "TAX_CLEARANCE",
+  "INSURANCE",
+  "CERTIFICATION",
+  "INDUSTRY_LICENCE",
+  "BANK_VERIFICATION",
+  "DATA_PROTECTION",
+  "HEALTH_AND_SAFETY",
+  "ANTI_BRIBERY",
+  "OTHER",
+] as const;
+
+export const VENDOR_DOCUMENT_TYPES = [
+  "CERTIFICATE",
+  "INSURANCE",
+  "TAX",
+  "CONTRACT",
+  "BANK_PROOF",
+  "OTHER",
+] as const;
+
+export const VENDOR_RISK_LEVELS = ["UNRATED", "LOW", "MEDIUM", "HIGH", "CRITICAL"] as const;
+
+/** Optional free text: an empty string from a form field means "not provided". */
+const optionalText = (max: number) => z.string().trim().max(max).optional().or(z.literal(""));
+const optionalEmail = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .max(160)
+  .email("Enter a valid email")
+  .optional()
+  .or(z.literal(""));
+const optionalDate = z.string().datetime({ offset: true }).or(z.string().date()).optional().or(z.literal(""));
 
 export const createVendorSchema = z.object({
   companyName: z.string().trim().min(2, "Company name is required").max(200),
-  contactPerson: z.string().trim().max(120).optional(),
-  email: z.string().trim().toLowerCase().email("Enter a valid email").optional().or(z.literal("")),
-  phone: z.string().trim().max(40).optional(),
-  address: z.string().trim().max(400).optional(),
-  category: z.string().trim().max(100).optional(),
-  taxNumber: z.string().trim().max(80).optional(),
-  bankName: z.string().trim().max(120).optional(),
-  bankAccount: z.string().trim().max(80).optional(),
+  legalName: optionalText(200),
+  tradingName: optionalText(200),
+  vendorType: z.enum(VENDOR_TYPES).default("SUPPLIER"),
+  description: optionalText(2000),
+  contactPerson: optionalText(120),
+  email: optionalEmail,
+  phone: optionalText(40),
+  website: optionalText(200),
+  address: optionalText(400),
+  city: optionalText(120),
+  stateRegion: optionalText(120),
+  postalCode: optionalText(40),
+  country: optionalText(120),
+  category: optionalText(100),
+  /** ProcurementCategory ids. The many-to-many that sourcing actually queries. */
+  categoryIds: z.array(z.string().min(1)).max(40).default([]),
+  taxNumber: optionalText(80),
+  registrationNumber: optionalText(80),
+  businessClassification: optionalText(120),
+  businessSize: z.enum(VENDOR_BUSINESS_SIZES).optional(),
+  incorporatedOn: optionalDate,
+  bankName: optionalText(120),
+  bankAccount: optionalText(80),
   paymentTerms: z.string().trim().max(60).default("NET_30"),
   preferredCurrency: z.string().trim().max(8).default("USD"),
+  leadTimeDays: z.number().int().min(0).max(3650).optional(),
+  minimumOrderValue: money.optional(),
   tags: z.array(z.string().trim().max(40)).max(20).default([]),
-  notes: z.string().trim().max(4000).optional(),
+  notes: optionalText(4000),
+  /**
+   * Set once an authorised user has reviewed the near-matches this vendor raised
+   * and confirmed it is a distinct company. Without it, a likely duplicate is
+   * refused rather than silently created.
+   */
+  acknowledgeDuplicates: z.boolean().default(false),
 });
 
-export const updateVendorSchema = createVendorSchema.partial();
+export const updateVendorSchema = createVendorSchema
+  .partial()
+  .omit({ acknowledgeDuplicates: true })
+  // See the note above: these five carry `.default()` on create, which survives
+  // `.partial()` and would make every PATCH overwrite them.
+  .extend({
+    vendorType: z.enum(VENDOR_TYPES).optional(),
+    categoryIds: z.array(z.string().min(1)).max(40).optional(),
+    tags: z.array(z.string().trim().max(40)).max(20).optional(),
+    paymentTerms: z.string().trim().max(60).optional(),
+    preferredCurrency: z.string().trim().max(8).optional(),
+  });
 
-export const vendorStatusSchema = z.object({
-  status: z.enum(VENDOR_STATUSES),
-  reason: z.string().trim().max(500).optional(),
+/** Listing contract for the vendor directory — filtered and paged server-side. */
+export const vendorListQuerySchema = listQuerySchema.extend({
+  compliance: z.string().trim().max(60).optional(),
+  risk: z.string().trim().max(60).optional(),
+  vendorType: z.string().trim().max(40).optional(),
+  country: z.string().trim().max(120).optional(),
+  categoryId: z.string().trim().max(60).optional(),
+  preferred: z.enum(["true", "false"]).optional(),
+  /** Documents or requirements lapsing within N days. */
+  expiringWithinDays: z.coerce.number().int().min(0).max(365).optional(),
+});
+
+export const vendorContactSchema = z.object({
+  name: z.string().trim().min(2, "Contact name is required").max(120),
+  email: optionalEmail,
+  phone: optionalText(40),
+  jobTitle: optionalText(120),
+  department: optionalText(120),
+  type: z.enum(VENDOR_CONTACT_TYPES).default("GENERAL"),
+  isPrimary: z.boolean().default(false),
+  isActive: z.boolean().default(true),
+  notes: optionalText(2000),
+});
+
+export const updateVendorContactSchema = vendorContactSchema.partial().extend({
+  // Defaulted on create; a partial edit must not silently demote a primary
+  // contact or reset its type. See the note on updateVendorSchema.
+  type: z.enum(VENDOR_CONTACT_TYPES).optional(),
+  isPrimary: z.boolean().optional(),
+  isActive: z.boolean().optional(),
+});
+
+export const vendorCategoriesSchema = z.object({
+  categoryIds: z.array(z.string().min(1)).max(40),
+  preferredCategoryIds: z.array(z.string().min(1)).max(40).default([]),
+});
+
+export const vendorDocumentSchema = z.object({
+  type: z.enum(VENDOR_DOCUMENT_TYPES),
+  name: z.string().trim().min(2, "Document name is required").max(200),
+  documentNumber: optionalText(120),
+  issuedAt: optionalDate,
+  expiresAt: optionalDate,
+  notes: optionalText(2000),
+  storedFileId: z.string().min(1).optional(),
+  /** Replaces an existing document; the superseded row is kept as history. */
+  supersedesId: z.string().min(1).optional(),
+  /** Attach the document to a compliance requirement in the same call. */
+  requirementId: z.string().min(1).optional(),
+});
+
+export const verifyDocumentSchema = z.object({
+  decision: z.enum(["VERIFIED", "REJECTED"]),
+  reason: optionalText(500),
+});
+
+export const complianceRequirementSchema = z.object({
+  type: z.enum(VENDOR_COMPLIANCE_TYPES),
+  name: z.string().trim().min(2, "Requirement name is required").max(160),
+  description: optionalText(2000),
+  isMandatory: z.boolean().default(true),
+  expiresAt: optionalDate,
+});
+
+export const updateComplianceRequirementSchema = complianceRequirementSchema.partial().extend({
+  // Defaulted true on create; a partial edit must not silently make an optional
+  // requirement mandatory again.
+  isMandatory: z.boolean().optional(),
+});
+
+export const complianceDecisionSchema = z
+  .object({
+    decision: z.enum(["VERIFIED", "REJECTED", "UNDER_REVIEW", "WAIVED"]),
+    notes: optionalText(1000),
+    expiresAt: optionalDate,
+  })
+  .refine((v) => v.decision !== "WAIVED" || (v.notes && v.notes.trim().length >= 10), {
+    message: "A waiver must record why the requirement is being set aside (at least 10 characters)",
+    path: ["notes"],
+  });
+
+export const vendorDecisionSchema = z.object({
+  stepId: z.string().min(1),
+  decision: z.enum(["APPROVED", "REJECTED"]),
+  comment: optionalText(2000),
+});
+
+/**
+ * Lifecycle actions, as verbs rather than as a target status.
+ *
+ * The client asks for "suspend", not for "status = SUSPENDED": the service owns
+ * which status each verb lands on and which permission it needs, so a caller can
+ * never name a state it is not entitled to move a vendor into.
+ */
+export const VENDOR_ACTIONS = [
+  "INVITE",
+  "START_ONBOARDING",
+  "SUBMIT_FOR_REVIEW",
+  "ACTIVATE",
+  "SUSPEND",
+  "REACTIVATE",
+  "DEACTIVATE",
+  "ARCHIVE",
+  "RESTORE",
+  "BLACKLIST",
+  "LIFT_BLACKLIST",
+  "SET_PREFERRED",
+  "CLEAR_PREFERRED",
+] as const;
+
+export const vendorActionSchema = z.object({
+  action: z.enum(VENDOR_ACTIONS),
+  reason: optionalText(500),
+});
+
+export const vendorRiskSchema = z.object({
+  level: z.enum(VENDOR_RISK_LEVELS),
+  score: z.number().min(0).max(100),
+  summary: optionalText(2000),
+  factors: z.record(z.string().max(40), z.number().min(0).max(100)).optional(),
+  nextReviewAt: optionalDate,
+});
+
+export const vendorNoteSchema = z.object({
+  body: z.string().trim().min(1, "A note cannot be empty").max(4000),
+  visibility: z.enum(["INTERNAL", "RESTRICTED"]).default("INTERNAL"),
+  isPinned: z.boolean().default(false),
+});
+
+export const duplicateCheckSchema = z.object({
+  companyName: z.string().trim().max(200).optional(),
+  legalName: z.string().trim().max(200).optional(),
+  taxNumber: z.string().trim().max(80).optional(),
+  registrationNumber: z.string().trim().max(80).optional(),
+  email: z.string().trim().toLowerCase().max(160).optional(),
+  /** Excluded from the results — used when editing an existing vendor. */
+  excludeId: z.string().max(60).optional(),
 });
 
 export const grantPortalAccessSchema = z.object({

@@ -2,19 +2,35 @@
 
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  Building2,
   Check,
   CheckCircle2,
   ClipboardCheck,
   Clock,
   Filter,
   Inbox,
+  Loader2,
   Search,
+  ShieldCheck,
   X,
 } from "lucide-react";
 import { useStore } from "@/lib/store";
-import { Avatar, EmptyState, KpiCard, PageHeader, PriorityBadge, SectionCard, StatusBadge } from "@/components/shared";
+import {
+  Avatar,
+  EmptyState,
+  KpiCard,
+  PageHeader,
+  PriorityBadge,
+  SectionCard,
+  StatusBadge,
+  VendorComplianceBadge,
+  VendorStatusBadge,
+} from "@/components/shared";
+import { api, mutate } from "@/lib/api/client";
+import { useServerData } from "@/lib/use-server-data";
+import type { Vendor } from "@/lib/types";
 import { formatCurrency, formatDate, formatRelativeTime } from "@/lib/format";
 import { ROLE_LABELS, type ApprovalStage } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -91,8 +107,12 @@ export function ApprovalsView() {
     <div className="space-y-6">
       <PageHeader
         title="Approvals"
-        description="Review and act on purchase requests awaiting your decision."
+        description="Everything awaiting your decision — purchase requests and supplier onboarding."
       />
+
+      {/* Vendor onboarding runs on the same approval engine as requests, so the
+          people who review suppliers find that work in the same place. */}
+      <VendorApprovalQueue />
 
       {/* KPI strip */}
       <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
@@ -299,5 +319,160 @@ export function ApprovalsView() {
         </>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Vendor onboarding approvals
+// ---------------------------------------------------------------------------
+
+interface VendorQueueItem {
+  id: string;
+  stage: string;
+  sequence: number;
+  slaExpiresAt?: string;
+  waitingSince: string;
+  vendor: Vendor;
+}
+
+/**
+ * Supplier onboarding awaiting this user.
+ *
+ * Fetched from /api/vendors/approvals/queue, which returns only steps that are
+ * genuinely actionable — the caller is the assigned approver and no earlier stage
+ * is still outstanding. Nothing is shown here that the server would refuse.
+ */
+function VendorApprovalQueue() {
+  const navigate = useStore((s) => s.navigate);
+  const selectVendor = useStore((s) => s.selectVendor);
+  const decideVendor = useStore((s) => s.decideVendor);
+
+  const [busy, setBusy] = useState<string | null>(null);
+  const [rejecting, setRejecting] = useState<VendorQueueItem | null>(null);
+  const [reason, setReason] = useState("");
+
+  const fetcher = useCallback(() => api.get<VendorQueueItem[]>("/api/vendors/approvals/queue"), []);
+  const { data: items, reload: load } = useServerData(fetcher);
+
+  // Nothing to decide, or the queue has not answered yet — this section simply
+  // is not part of the page. An empty "no vendor approvals" card would be noise
+  // on a screen that is mostly about purchase requests.
+  if (!items || items.length === 0) return null;
+
+  const decide = async (item: VendorQueueItem, decision: "APPROVED" | "REJECTED", comment?: string) => {
+    setBusy(item.id);
+    const ok = await mutate(
+      () => decideVendor(item.vendor.id, item.id, decision, comment),
+      {
+        success:
+          decision === "APPROVED"
+            ? `${item.vendor.companyName} cleared this stage`
+            : `${item.vendor.companyName} rejected`,
+      }
+    );
+    setBusy(null);
+    setRejecting(null);
+    setReason("");
+    if (ok !== null) await load();
+  };
+
+  return (
+    <>
+      <SectionCard
+        title="Supplier onboarding awaiting you"
+        description="Approving clears your stage; the supplier moves on to the next reviewer or becomes approved."
+      >
+        <div className="space-y-2">
+          {items.map((item) => (
+            <div
+              key={item.id}
+              className="flex flex-col gap-3 rounded-lg border border-border p-3 sm:flex-row sm:items-center sm:justify-between"
+            >
+              <button
+                onClick={() => {
+                  selectVendor(item.vendor.id);
+                  navigate("vendor-detail");
+                }}
+                className="flex min-w-0 items-center gap-3 text-left"
+              >
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-emerald-500 to-teal-600 text-xs font-semibold text-white">
+                  {item.vendor.companyName.slice(0, 2).toUpperCase()}
+                </div>
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium text-foreground">
+                    {item.vendor.companyName}
+                  </p>
+                  <p className="truncate text-xs text-muted-foreground">
+                    {item.stage.replace(/_/g, " ").toLowerCase()} · waiting{" "}
+                    {formatRelativeTime(item.waitingSince)}
+                    {item.slaExpiresAt ? ` · due ${formatRelativeTime(item.slaExpiresAt)}` : ""}
+                  </p>
+                </div>
+              </button>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <VendorComplianceBadge state={item.vendor.complianceState} />
+                <VendorStatusBadge status={item.vendor.status} />
+                <button
+                  onClick={() => void decide(item, "APPROVED")}
+                  disabled={busy === item.id}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-emerald-600 px-3 text-sm font-medium text-white transition-colors hover:bg-emerald-700 disabled:opacity-50"
+                >
+                  {busy === item.id ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+                  Approve
+                </button>
+                <button
+                  onClick={() => {
+                    setRejecting(item);
+                    setReason("");
+                  }}
+                  disabled={busy === item.id}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border bg-card px-3 text-sm font-medium transition-colors hover:bg-muted disabled:opacity-50"
+                >
+                  <X size={13} /> Reject
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </SectionCard>
+
+      {rejecting && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-xl">
+            <h3 className="text-base font-semibold text-foreground">
+              Reject {rejecting.vendor.companyName}?
+            </h3>
+            <p className="mt-1.5 text-sm text-muted-foreground">
+              The reason is shown to whoever put this supplier forward, and the approval history is
+              kept so a later resubmission can be read against it.
+            </p>
+            <textarea
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              rows={3}
+              placeholder="Why is this supplier not being approved?"
+              className="mt-4 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                onClick={() => setRejecting(null)}
+                className="inline-flex h-9 items-center rounded-lg border border-border bg-card px-3.5 text-sm font-medium hover:bg-muted"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void decide(rejecting, "REJECTED", reason)}
+                disabled={reason.trim().length === 0 || busy !== null}
+                className="inline-flex h-9 items-center gap-2 rounded-lg bg-rose-600 px-3.5 text-sm font-medium text-white hover:bg-rose-700 disabled:opacity-50"
+              >
+                {busy !== null && <Loader2 size={14} className="animate-spin" />}
+                Reject supplier
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }

@@ -30,6 +30,8 @@ const TENANT_MODELS = new Set<string>([
   "CostCenter",
   "ProcurementCategory",
   "VendorCategoryLink",
+  "VendorComplianceRequirement",
+  "VendorNote",
   "SupplierUser",
   "Vendor",
   "PurchaseRequest",

@@ -114,7 +114,8 @@ export function AiAssistantView() {
     if (p.includes("risk") || p.includes("bottleneck") || p.includes("delay")) {
       const pendingApprovals = requests.flatMap((r) => r.approvals).filter((a) => a.decision === "PENDING");
       const slaBreached = pendingApprovals.filter((a) => new Date(a.slaExpiresAt) < new Date());
-      const expiringQuotes = useStore.getState().rfqs.filter((r) => r.status === "WAITING" && new Date(r.deadline) < new Date(Date.now() + 3 * 86400000));
+      const expiringQuotes = useStore.getState().rfqs.filter((r) => (r.status === "PUBLISHED" || r.status === "RESPONSE_PERIOD") &&
+          new Date(r.deadline) < new Date(Date.now() + 3 * 86400000));
       const blacklisted = vendors.filter((v) => v.status === "BLACKLISTED");
       const expiringDocs = vendors.flatMap((v) => v.documents).filter((d) => d.status === "EXPIRED" || d.status === "EXPIRING");
       return {

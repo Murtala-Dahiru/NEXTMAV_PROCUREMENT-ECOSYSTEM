@@ -56,3 +56,6 @@ server.log
 /skills/
 # Local throwaway Postgres cluster used by scripts/verify/local-postgres.mjs
 .tmp-pg/
+
+# Editor/tooling backups — schema.prisma.bak and friends are local artifacts.
+*.bak

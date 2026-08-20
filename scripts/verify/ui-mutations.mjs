@@ -16,6 +16,7 @@ const bad = (n, d = "") => { fail++; console.log(`  \x1b[31mFAIL\x1b[0m  ${n}${d
 const check = (c, n, d = "") => (c ? ok(n, d) : bad(n, d));
 
 async function client(email) {
+  const jar = new Map();
   let cookie = "";
   const req = async (method, path, body) => {
     const res = await fetch(`${BASE}${path}`, {
@@ -23,10 +24,18 @@ async function client(email) {
       headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
+    // Supabase issues `sb-<ref>-auth-token`, chunked into `.0`/`.1` when the JWT
+    // exceeds 4KB, so every cookie is kept rather than one fixed name.
     for (const c of res.headers.getSetCookie?.() ?? []) {
       const [p] = c.split(";");
-      if (p.startsWith("nextmav.sid=")) cookie = p;
+      const eq = p.indexOf("=");
+      if (eq < 1) continue;
+      const name = p.slice(0, eq);
+      const value = p.slice(eq + 1);
+      if (value === "" || value === "deleted") jar.delete(name);
+      else jar.set(name, value);
     }
+    cookie = [...jar].map(([k, v]) => `${k}=${v}`).join("; ");
     const t = await res.text();
     let b = null;
     if (t) { try { b = JSON.parse(t); } catch { b = t; } }

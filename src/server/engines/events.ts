@@ -8,7 +8,7 @@
 // A service therefore never writes a Notification row directly — it emits, and
 // routing is decided in one place from the recipient's preferences.
 
-import type { NotificationType } from "@prisma/client";
+import type { NotificationType, SupplierActivityType } from "@prisma/client";
 import { db } from "../db";
 
 export type DomainEventType =
@@ -23,9 +23,24 @@ export type DomainEventType =
   | "approval.reminder"
   | "approval.delegated"
   | "rfq.invited"
+  | "rfq.approval_required"
+  | "rfq.approved"
+  | "rfq.rejected"
+  | "rfq.published"
+  | "rfq.invitation_accepted"
+  | "rfq.invitation_declined"
   | "rfq.quotation_received"
+  | "rfq.quotation_withdrawn"
+  | "rfq.clarification_asked"
+  | "rfq.clarification_issued"
   | "rfq.deadline_approaching"
+  | "rfq.closed"
+  | "rfq.cancelled"
+  | "rfq.revision_requested"
+  | "rfq.evaluation_required"
+  | "rfq.award_approval_required"
   | "rfq.awarded"
+  | "rfq.result"
   | "po.issued"
   | "po.acknowledged"
   | "po.cancelled"
@@ -44,6 +59,14 @@ export type DomainEventType =
   | "budget.exceeded"
   | "contract.expiring"
   | "contract.expired"
+  | "vendor.invited"
+  | "vendor.onboarding_submitted"
+  | "vendor.approval_required"
+  | "vendor.approved"
+  | "vendor.rejected"
+  | "vendor.activated"
+  | "vendor.suspended"
+  | "vendor.compliance_issue"
   | "vendor.compliance_expiring"
   | "inventory.reorder_required"
   | "sla.breached";
@@ -61,9 +84,27 @@ const EVENT_CATEGORY: Record<DomainEventType, keyof CategoryPrefs> = {
   "approval.reminder": "catApprovals",
   "approval.delegated": "catApprovals",
   "rfq.invited": "catRfqs",
+  // Publication and award approvals are approvals first and sourcing second:
+  // routed through the approvals category so somebody who muted RFQ chatter is
+  // still told when a decision is waiting on them.
+  "rfq.approval_required": "catApprovals",
+  "rfq.approved": "catApprovals",
+  "rfq.rejected": "catApprovals",
+  "rfq.published": "catRfqs",
+  "rfq.invitation_accepted": "catRfqs",
+  "rfq.invitation_declined": "catRfqs",
   "rfq.quotation_received": "catRfqs",
+  "rfq.quotation_withdrawn": "catRfqs",
+  "rfq.clarification_asked": "catRfqs",
+  "rfq.clarification_issued": "catRfqs",
   "rfq.deadline_approaching": "catRfqs",
+  "rfq.closed": "catRfqs",
+  "rfq.cancelled": "catRfqs",
+  "rfq.revision_requested": "catRfqs",
+  "rfq.evaluation_required": "catApprovals",
+  "rfq.award_approval_required": "catApprovals",
   "rfq.awarded": "catRfqs",
+  "rfq.result": "catRfqs",
   "po.issued": "catPurchaseOrders",
   "po.acknowledged": "catPurchaseOrders",
   "po.cancelled": "catPurchaseOrders",
@@ -82,6 +123,17 @@ const EVENT_CATEGORY: Record<DomainEventType, keyof CategoryPrefs> = {
   "budget.exceeded": "catBudgetAlerts",
   "contract.expiring": "catRequests",
   "contract.expired": "catRequests",
+  // Vendor events ride the requests category until the notification preference
+  // model grows a vendor channel of its own; routing them through a category that
+  // does not exist would silently drop them.
+  "vendor.invited": "catRequests",
+  "vendor.onboarding_submitted": "catRequests",
+  "vendor.approval_required": "catApprovals",
+  "vendor.approved": "catApprovals",
+  "vendor.rejected": "catApprovals",
+  "vendor.activated": "catRequests",
+  "vendor.suspended": "catRequests",
+  "vendor.compliance_issue": "catRequests",
   "vendor.compliance_expiring": "catRequests",
   "inventory.reorder_required": "catRequests",
   "sla.breached": "catSlaWarnings",
@@ -127,6 +179,7 @@ export async function emit(event: DomainEvent): Promise<void> {
   try {
     await Promise.all([
       fanoutInApp(event),
+      fanoutToSupplier(event),
       queueWebhooks(event),
       publishRealtime(event),
     ]);
@@ -192,6 +245,71 @@ async function fanoutInApp(event: DomainEvent): Promise<void> {
   if (deliveries.length > 0) {
     await db.notificationDelivery.createMany({ data: deliveries });
   }
+}
+
+/**
+ * Which supplier-side activity an event becomes.
+ *
+ * Suppliers have no row in `Notification` — that table is keyed to `User`, which
+ * is the employee realm, and giving external contacts a foreign key into it is
+ * exactly the kind of shared surface src/server/session.ts refuses. Their feed is
+ * `SupplierActivity`, which the portal reads.
+ */
+const SUPPLIER_ACTIVITY: Partial<Record<DomainEventType, SupplierActivityType>> = {
+  "rfq.invited": "RFQ_RECEIVED",
+  "rfq.deadline_approaching": "RFQ_RECEIVED",
+  "rfq.clarification_issued": "CLARIFICATION_ANSWERED",
+  "rfq.revision_requested": "QUOTE_REVISED",
+  "rfq.closed": "RFQ_RECEIVED",
+  "rfq.cancelled": "RFQ_RECEIVED",
+  "rfq.awarded": "AWARD_RECEIVED",
+  "rfq.result": "AWARD_LOST",
+  "vendor.approved": "MESSAGE_RECEIVED",
+  "vendor.suspended": "MESSAGE_RECEIVED",
+  "vendor.compliance_expiring": "MESSAGE_RECEIVED",
+};
+
+/**
+ * Delivers an event addressed to a supplier.
+ *
+ * Before this existed, `DomainEvent.vendorId` was documented but never read: every
+ * supplier-facing notification the platform emitted went nowhere. The row written
+ * here is what the portal's activity feed renders, and the delivery rows are the
+ * queue an email worker drains — nothing claims a message was *sent* until a
+ * worker marks it so.
+ */
+async function fanoutToSupplier(event: DomainEvent): Promise<void> {
+  if (!event.vendorId) return;
+
+  const activityType = SUPPLIER_ACTIVITY[event.type];
+  if (activityType) {
+    await db.supplierActivity.create({
+      data: {
+        vendorId: event.vendorId,
+        type: activityType,
+        description: event.title,
+        referenceId: event.entityId ?? null,
+      },
+    });
+  }
+
+  const contacts = await db.supplierUser.findMany({
+    where: {
+      vendorId: event.vendorId,
+      organizationId: event.organizationId,
+      accessStatus: "ACTIVE",
+    },
+    select: { email: true },
+  });
+  if (contacts.length === 0) return;
+
+  await db.notificationDelivery.createMany({
+    data: contacts.map((c) => ({
+      channel: "EMAIL",
+      recipient: c.email,
+      status: "PENDING",
+    })),
+  });
 }
 
 function inQuietHours(start: string | null, end: string | null): boolean {

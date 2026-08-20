@@ -16,7 +16,14 @@
 import { PrismaClient, Prisma } from "@prisma/client";
 import { hashPassword } from "../src/server/password.ts";
 import { ensureSystemRoles } from "../src/server/roles.ts";
+import { ensureVendorOnboardingWorkflow } from "../src/server/vendor-workflow.ts";
+import {
+  ensureRfqApprovalWorkflow,
+  ensureAwardApprovalWorkflow,
+} from "../src/server/sourcing-workflow.ts";
 import * as seed from "../src/lib/seed-data.ts";
+// Vendor fixtures live beside the seeder rather than in the client bundle.
+import { seedVendors } from "./seed-vendors.ts";
 
 const db = new PrismaClient({ log: ["error"] });
 
@@ -94,13 +101,19 @@ async function reset() {
     db.contractVersion,
     db.contract,
     db.quotationLineItem,
+    db.quotationScoreHistory,
     db.quotationScore,
+    db.awardRecommendationItem,
     db.rFQAward,
+    db.awardRecommendation,
     db.quotation,
+    db.rFQClarification,
+    db.rFQEvaluator,
     db.rFQEvaluationCriterion,
     db.rFQVendor,
     db.rFQLineItem,
     db.rFQ,
+    db.sourcingEvent,
     db.comment,
     db.requestWatcher,
     db.requestVersion,
@@ -230,7 +243,7 @@ async function main() {
     ...new Set(
       [
         ...seed.seedRequests.map((r) => r.category),
-        ...seed.seedVendors.map((v) => v.category),
+        ...seedVendors.map((v) => v.category),
       ].filter((c): c is string => Boolean(c))
     ),
   ];
@@ -333,7 +346,7 @@ async function main() {
   // -------------------------------------------------------------------------
   // Vendors + compliance documents
   // -------------------------------------------------------------------------
-  for (const v of seed.seedVendors) {
+  for (const v of seedVendors) {
     await db.vendor.create({
       data: {
         id: v.id,
@@ -375,7 +388,7 @@ async function main() {
       },
     });
   }
-  console.log(`  vendors ${seed.seedVendors.length}`);
+  console.log(`  vendors ${seedVendors.length}`);
 
   // -------------------------------------------------------------------------
   // Approval workflows
@@ -411,7 +424,25 @@ async function main() {
       },
     });
   }
-  console.log(`  workflows ${seed.seedWorkflows.length}`);
+  // Vendor onboarding runs on the same engine as purchase requests; this is the
+  // starting configuration for it, installed as ordinary rows.
+  const vendorWf = await ensureVendorOnboardingWorkflow(
+    org.id,
+    db as unknown as Parameters<typeof ensureVendorOnboardingWorkflow>[1]
+  );
+  // Sourcing runs on it too: publication is gated by one, the award by another.
+  const rfqWf = await ensureRfqApprovalWorkflow(
+    org.id,
+    db as unknown as Parameters<typeof ensureRfqApprovalWorkflow>[1]
+  );
+  const awardWf = await ensureAwardApprovalWorkflow(
+    org.id,
+    db as unknown as Parameters<typeof ensureAwardApprovalWorkflow>[1]
+  );
+  const installed = [vendorWf, rfqWf, awardWf].filter((w) => w.created).length;
+  console.log(
+    `  workflows ${seed.seedWorkflows.length + installed} (incl. vendor onboarding, RFQ publication, award approval)`
+  );
 
   // -------------------------------------------------------------------------
   // Budgets
@@ -600,34 +631,97 @@ async function main() {
   // -------------------------------------------------------------------------
   // RFQs (+ invitations, quotations)
   // -------------------------------------------------------------------------
+  let sourcingEventSeq = 0;
+
   for (const rfq of seed.seedRFQs) {
+    const created = dateOr(rfq.createdAt);
+    const currency = rfq.quotations?.[0]?.currency ?? org.currency;
+
+    // Every RFQ hangs off a sourcing event — §36 does not admit one that does not.
+    // The event carries the link back to the request, so an award is traceable to
+    // the requirement that justified it.
+    sourcingEventSeq += 1;
+    const eventId = `se_${rfq.id}`;
+    await db.sourcingEvent.create({
+      data: {
+        id: eventId,
+        organizationId: org.id,
+        eventNumber: `SE-${created.getFullYear()}-${String(sourcingEventSeq).padStart(4, "0")}`,
+        title: rfq.title,
+        description: rfq.description ?? null,
+        requestId: rfq.requestId ?? null,
+        type: "RFQ",
+        status:
+          rfq.status === "AWARDED"
+            ? "AWARDED"
+            : rfq.status === "CANCELLED"
+              ? "CANCELLED"
+              : "ACTIVE",
+        currency,
+        responseDeadline: dateOr(rfq.deadline),
+        publishedAt: created,
+        awardedAt: rfq.selectedQuotationId ? created : null,
+        createdAt: created,
+      },
+    });
+
+    // Line items derived from the linked request rather than invented, so the
+    // demo tenant demonstrates the same traceability the application enforces.
+    const sourceRequest = seed.seedRequests.find((r) => r.id === rfq.requestId);
+    const rfqLines = (sourceRequest?.lineItems ?? []).map((li, i) => ({
+      id: `rfqli_${rfq.id}_${i}`,
+      itemName: li.itemName,
+      description: li.description ?? null,
+      quantity: li.quantity,
+      unit: li.unit,
+      targetPrice: li.estimatedCost,
+      requestLineItemId: li.id,
+      sortOrder: i,
+    }));
+
+    // Weight each line by what the requester estimated, so a bid's total is spread
+    // across the lines in the proportions the requirement implies and the line
+    // totals add back to exactly the quoted total.
+    const weightTotal = rfqLines.reduce((sum, l) => sum + l.targetPrice * l.quantity, 0);
+
     await db.rFQ.create({
       data: {
         id: rfq.id,
         organizationId: org.id,
+        sourcingEventId: eventId,
         rfqNumber: rfq.rfqNumber,
         requestId: rfq.requestId ?? null,
         title: rfq.title,
         description: rfq.description ?? null,
         deadline: dateOr(rfq.deadline),
         status: rfq.status,
+        currency,
+        estimatedValue: weightTotal || null,
+        evaluationMethod: "LOWEST_PRICE",
+        publishedAt: created,
+        closedAt: rfq.selectedQuotationId ? created : null,
+        awardedAt: rfq.selectedQuotationId ? created : null,
         remindersSent: rfq.remindersSent ?? 0,
-        createdAt: dateOr(rfq.createdAt),
+        createdAt: created,
+        lineItems: { create: rfqLines },
         invitedVendors: {
           create: (rfq.invitedVendorIds ?? []).map((vendorId) => ({
             vendorId,
             status: (rfq.quotations ?? []).some((q) => q.vendorId === vendorId)
               ? ("QUOTED" as const)
               : ("INVITED" as const),
-            invitedAt: dateOr(rfq.createdAt),
+            invitedAt: created,
+            respondedAt: (rfq.quotations ?? []).some((q) => q.vendorId === vendorId) ? created : null,
           })),
         },
         quotations: {
-          create: (rfq.quotations ?? []).map((q) => ({
+          create: (rfq.quotations ?? []).map((q, qi) => ({
             id: q.id,
             organizationId: org.id,
             vendorId: q.vendorId,
+            quotationNumber: `QUO-${created.getFullYear()}-${String(qi + 1).padStart(4, "0")}-${rfq.rfqNumber.slice(-4)}`,
             revision: 1,
+            subtotal: q.totalAmount,
             totalAmount: q.totalAmount,
             currency: q.currency ?? org.currency,
             deliveryDays: q.deliveryDays ?? 0,
@@ -639,6 +733,22 @@ async function main() {
               rfq.selectedQuotationId === q.id ? ("SELECTED" as const) : ("RECEIVED" as const),
             submittedAt: dateOr(q.createdAt),
             createdAt: dateOr(q.createdAt),
+            lineItems: {
+              create: rfqLines.map((l, i) => {
+                const share = weightTotal > 0 ? (l.targetPrice * l.quantity) / weightTotal : 1 / rfqLines.length;
+                const lineTotal = Math.round(q.totalAmount * share * 100) / 100;
+                return {
+                  rfqLineItemId: l.id,
+                  itemName: l.itemName,
+                  description: l.description,
+                  quantity: l.quantity,
+                  unit: l.unit,
+                  unitPrice: l.quantity > 0 ? Math.round((lineTotal / l.quantity) * 10000) / 10000 : 0,
+                  lineTotal,
+                  sortOrder: i,
+                };
+              }),
+            },
           })),
         },
       },
@@ -1148,6 +1258,8 @@ async function main() {
   const sequences: Array<[string, number]> = [
     ["PR", highest(seed.seedRequests.map((r) => r.requestNumber))],
     ["RFQ", highest(seed.seedRFQs.map((r) => r.rfqNumber))],
+    ["SE", seed.seedRFQs.length],
+    ["QUO", seed.seedRFQs.reduce((n, r) => n + (r.quotations?.length ?? 0), 0)],
     ["PO", highest(seed.seedPurchaseOrders.map((p) => p.poNumber))],
     ["GRN", highest(seed.seedGoodsReceipts.map((g) => g.receiptNumber))],
     ["INV", highest(seed.seedInvoices.map((i) => i.invoiceNumber))],

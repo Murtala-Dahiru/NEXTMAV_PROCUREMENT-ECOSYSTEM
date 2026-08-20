@@ -14,8 +14,14 @@ import {
   PRIORITY_META,
   PO_STATUS_META,
   RFQ_STATUS_META,
+  RFQ_INVITATION_STATUS_META,
+  QUOTATION_STATUS_META,
+  SOURCING_EVENT_STATUS_META,
   STATUS_META,
   VENDOR_STATUS_META,
+  VENDOR_COMPLIANCE_META,
+  VENDOR_RISK_META,
+  VENDOR_COMPLIANCE_ITEM_META,
   type AssetStatus,
   type ContractStatus,
   type GoodsReceiptStatus,
@@ -24,8 +30,14 @@ import {
   type Priority,
   type PurchaseOrderStatus,
   type RFQStatus,
+  type RFQInvitationStatus,
+  type QuotationStatus,
+  type SourcingEventStatus,
   type RequestStatus,
   type VendorStatus,
+  type VendorComplianceState,
+  type VendorComplianceStatus,
+  type VendorRiskLevel,
 } from "@/lib/types";
 import { ratingBg } from "@/lib/format";
 
@@ -59,10 +71,76 @@ export function RFQStatusBadge({ status }: { status: RFQStatus }) {
   );
 }
 
+export function SourcingEventStatusBadge({ status }: { status: SourcingEventStatus }) {
+  const meta = SOURCING_EVENT_STATUS_META[status];
+  return (
+    <span className={cn("inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded-full border", meta.color)}>
+      <span className={cn("h-1.5 w-1.5 rounded-full", meta.dot)} />
+      {meta.label}
+    </span>
+  );
+}
+
+export function QuotationStatusBadge({ status }: { status: QuotationStatus }) {
+  const meta = QUOTATION_STATUS_META[status];
+  return (
+    <span className={cn("inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded-full border", meta.color)}>
+      <span className={cn("h-1.5 w-1.5 rounded-full", meta.dot)} />
+      {meta.label}
+    </span>
+  );
+}
+
+export function InvitationStatusBadge({ status }: { status: RFQInvitationStatus }) {
+  const meta = RFQ_INVITATION_STATUS_META[status];
+  return (
+    <span className={cn("inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded-full border", meta.color)}>
+      <span className={cn("h-1.5 w-1.5 rounded-full", meta.dot)} />
+      {meta.label}
+    </span>
+  );
+}
+
 export function VendorStatusBadge({ status }: { status: VendorStatus }) {
   const meta = VENDOR_STATUS_META[status];
   return (
     <span className={cn("inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium whitespace-nowrap", meta.color)}>
+      <span className={cn("h-1.5 w-1.5 rounded-full", meta.dot)} />
+      {meta.label}
+    </span>
+  );
+}
+
+/**
+ * The three facts a vendor row has to carry beside its name: where it is in the
+ * lifecycle, whether its paperwork is in order, and how risky it is. They share
+ * one badge shape so a directory row reads as a sentence rather than as three
+ * competing widgets.
+ */
+export function VendorComplianceBadge({ state }: { state: VendorComplianceState }) {
+  const meta = VENDOR_COMPLIANCE_META[state];
+  return (
+    <span className={cn("inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium whitespace-nowrap", meta.color)}>
+      <span className={cn("h-1.5 w-1.5 rounded-full", meta.dot)} />
+      {meta.label}
+    </span>
+  );
+}
+
+export function VendorRiskBadge({ level }: { level: VendorRiskLevel }) {
+  const meta = VENDOR_RISK_META[level];
+  return (
+    <span className={cn("inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium whitespace-nowrap", meta.color)}>
+      <span className={cn("h-1.5 w-1.5 rounded-full", meta.dot)} />
+      {meta.label}
+    </span>
+  );
+}
+
+export function ComplianceItemBadge({ status }: { status: VendorComplianceStatus }) {
+  const meta = VENDOR_COMPLIANCE_ITEM_META[status];
+  return (
+    <span className={cn("inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium whitespace-nowrap", meta.color)}>
       <span className={cn("h-1.5 w-1.5 rounded-full", meta.dot)} />
       {meta.label}
     </span>

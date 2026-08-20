@@ -7,13 +7,19 @@
 //
 // Formats are unchanged from the existing product — PR-2026-0001, RFQ-2026-0001,
 // PO-2026-0001 — and extended to the modules that had no numbering before.
+//
+// Quotations are numbered per buying organization rather than per supplier: the
+// number is the buyer's handle on the bid, and a supplier's own reference is
+// carried separately on `Quotation.supplierReference`.
 
 import { db } from "./db";
 import type { Tx } from "./db";
 
 export const PREFIX = {
   request: "PR",
+  sourcingEvent: "SE",
   rfq: "RFQ",
+  quotation: "QUO",
   purchaseOrder: "PO",
   goodsReceipt: "GRN",
   invoice: "INV",
